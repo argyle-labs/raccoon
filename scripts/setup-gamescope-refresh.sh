@@ -24,6 +24,25 @@ EOF
 echo ">> Wrote $DEST:"
 cat "$DEST"
 echo
+
+# HDR: gamescope-session-plus only exports ENABLE_GAMESCOPE_HDR inside its
+# nvidia branch, so AMD GPUs never get --hdr-enabled even when the panel and
+# Steam report HDR support. Set it here (WSI is already on by default).
+# Set ENABLE_HDR=0 to skip (e.g. SDR-only panel).
+ENABLE_HDR="${ENABLE_HDR:-1}"
+HDR_DEST="$HOME/.config/environment.d/15-gamescope-hdr.conf"
+if [ "$ENABLE_HDR" = "1" ]; then
+  cat > "$HDR_DEST" <<EOF
+# AMD GPUs do not hit the nvidia branch in gamescope-session-plus that sets
+# ENABLE_GAMESCOPE_HDR, so HDR never gets wired even though the panel + Steam
+# report it as supported. Set it here; the session sources environment.d with
+# auto-export before building the --hdr-enabled flags.
+ENABLE_GAMESCOPE_HDR=1
+EOF
+  echo ">> Wrote $HDR_DEST:"
+  cat "$HDR_DEST"
+  echo
+fi
 echo ">> modes.cfg (current forced output, if any):"
 cat "$HOME/.config/gamescope/modes.cfg" 2>/dev/null || echo "   (none - set resolution/refresh in Gaming Mode -> Display)"
 echo
