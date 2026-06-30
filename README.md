@@ -1,4 +1,4 @@
-# linux-gaming
+# raccoon
 
 Opinionated, reproducible setup for a Linux gaming machine — every launcher and
 the system tweaks that make them work, in one place. Bring up a fresh box (or
@@ -25,8 +25,8 @@ Both feed the Steam library, so everything ends up as tiles in Gaming Mode.
 ## Quick start
 
 ```bash
-git clone https://github.com/argyle-labs/linux-gaming.git
-cd linux-gaming
+git clone https://github.com/argyle-labs/raccoon.git
+cd raccoon
 ./bootstrap.sh            # detects distro, installs launchers, applies configs
 ```
 
