@@ -1,0 +1,3 @@
+# Arm USB wake-from-suspend for all USB devices and host controllers.
+# Lets a USB/dongle/wired game controller wake the machine. (BT cannot wake.)
+ACTION=="add", SUBSYSTEM=="usb", TEST=="power/wakeup", ATTR{power/wakeup}="enabled"
