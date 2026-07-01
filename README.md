@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon-256.png" width="120" alt="raccoon" />
+</p>
+
 # raccoon
 
 Opinionated, reproducible setup for a Linux gaming machine — every launcher and
