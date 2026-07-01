@@ -13,48 +13,40 @@
   </defs>
   <g clip-path="url(#tile)"><rect x="16" y="16" width="480" height="480" fill="url(#argyle)"/></g>
   <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#2BD3D3" stroke-width="6"/>
-  <!-- Raccoon face. Head + ears are ONE continuous silhouette (ears flow into the
-       head — no side gaps), then the mask, eyes, nose and whiskers sit on top. -->
+  <!-- Minimalist raccoon: shield head with pointed corner ears (one silhouette),
+       twin eye-sockets split by a narrow forehead blaze, bold eyes + heart nose. -->
   <g>
-    <!-- fluffy cheeks (widen the lower face) -->
-    <circle cx="150" cy="272" r="36" fill="#56AB7B"/>
-    <circle cx="362" cy="272" r="36" fill="#56AB7B"/>
-    <!-- unified head + ears silhouette -->
-    <path d="M150 252
-             C144 212 148 184 156 172
-             C152 128 166 98 184 98
-             C198 98 206 132 212 168
-             C230 160 282 160 300 168
-             C306 132 314 98 328 98
-             C346 98 360 128 356 172
-             C364 184 368 212 362 252
-             C362 322 320 360 256 360
-             C192 360 150 322 150 252 Z" fill="#56AB7B"/>
-    <!-- muzzle -->
-    <ellipse cx="256" cy="316" rx="52" ry="44" fill="#56AB7B"/>
+    <!-- head + pointed corner ears as one continuous silhouette -->
+    <path d="M140 240
+             C132 184 138 162 150 156
+             L152 84 L210 150
+             C230 142 282 142 302 150
+             L360 84 L362 156
+             C374 162 380 184 372 240
+             C372 318 320 374 256 374
+             C192 374 140 318 140 240 Z" fill="#56AB7B"/>
     <!-- inner ears -->
-    <path d="M170 168 C170 140 178 122 186 120 C196 122 202 142 200 168 Z" fill="#123026"/>
-    <path d="M342 168 C342 140 334 122 326 120 C316 122 310 142 312 168 Z" fill="#123026"/>
+    <path d="M168 148 L172 102 L202 146 Z" fill="#123026"/>
+    <path d="M344 148 L340 102 L310 146 Z" fill="#123026"/>
     <!-- whiskers -->
-    <g stroke="#C7E9D8" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.75">
-      <path d="M232 306 Q192 294 146 298"/>
-      <path d="M234 314 Q194 314 142 318"/>
-      <path d="M232 322 Q192 328 148 336"/>
-      <path d="M280 306 Q320 294 366 298"/>
-      <path d="M278 314 Q318 314 370 318"/>
-      <path d="M280 322 Q320 328 364 336"/>
+    <g stroke="#C7E9D8" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.7">
+      <path d="M230 316 Q192 306 150 310"/>
+      <path d="M232 324 Q194 326 148 332"/>
+      <path d="M282 316 Q320 306 362 310"/>
+      <path d="M280 324 Q318 326 364 332"/>
     </g>
-    <!-- the mask: twin eye-patches + a bridge funnelling to the nose, split by a
-         pale blaze up the centre of the forehead -->
-    <ellipse cx="208" cy="238" rx="34" ry="30" fill="#123026"/>
-    <ellipse cx="304" cy="238" rx="34" ry="30" fill="#123026"/>
-    <path d="M226 252 Q256 246 286 252 Q276 298 256 304 Q236 298 226 252 Z" fill="#123026"/>
-    <!-- eyes within the mask -->
-    <circle cx="208" cy="240" r="12" fill="#0B1712"/>
-    <circle cx="304" cy="240" r="12" fill="#0B1712"/>
-    <circle cx="212" cy="236" r="4" fill="#9BD4B4"/>
-    <circle cx="308" cy="236" r="4" fill="#9BD4B4"/>
-    <!-- dark nose at the muzzle tip -->
-    <path d="M240 304 Q256 297 272 304 Q270 324 256 332 Q242 324 240 304 Z" fill="#0B1712"/>
+    <!-- bandit mask: twin sockets + bridge to the nose, narrow pale blaze between -->
+    <ellipse cx="200" cy="252" rx="46" ry="42" fill="#123026"/>
+    <ellipse cx="312" cy="252" rx="46" ry="42" fill="#123026"/>
+    <path d="M226 268 Q256 262 286 268 Q278 302 256 308 Q234 302 226 268 Z" fill="#123026"/>
+    <!-- eyes: pale socket + dark pupil -->
+    <ellipse cx="200" cy="250" rx="17" ry="20" fill="#56AB7B"/>
+    <ellipse cx="312" cy="250" rx="17" ry="20" fill="#56AB7B"/>
+    <circle cx="200" cy="252" r="9" fill="#0B1712"/>
+    <circle cx="312" cy="252" r="9" fill="#0B1712"/>
+    <circle cx="203" cy="248" r="3" fill="#DCF1E6"/>
+    <circle cx="315" cy="248" r="3" fill="#DCF1E6"/>
+    <!-- heart nose at the muzzle -->
+    <path d="M234 300 Q256 292 278 300 Q272 328 256 338 Q240 328 234 300 Z" fill="#0B1712"/>
   </g>
 </svg>
