@@ -13,20 +13,36 @@
   </defs>
   <g clip-path="url(#tile)"><rect x="16" y="16" width="480" height="480" fill="url(#argyle)"/></g>
   <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#2BD3D3" stroke-width="6"/>
-  <!-- Raccoon face silhouette: solid pointed ears, muzzle bump, signature horizontal bandit mask. -->
+  <!-- Minimalist raccoon head: rounded ears integrated into the head, a bandit
+       mask with almond eyes split by a downward forehead blaze, bold heart nose. -->
   <g>
-    <!-- solid pointed ears -->
-    <polygon points="150,152 216,146 172,74" fill="#56AB7B"/>
-    <polygon points="362,152 296,146 340,74" fill="#56AB7B"/>
-    <!-- head + muzzle -->
-    <ellipse cx="256" cy="238" rx="120" ry="106" fill="#56AB7B"/>
-    <ellipse cx="256" cy="304" rx="54" ry="48" fill="#56AB7B"/>
-    <!-- bandit mask band across the eyes -->
-    <rect x="172" y="210" width="168" height="54" rx="27" fill="#123026"/>
-    <!-- eyes inside the mask -->
-    <circle cx="210" cy="237" r="11" fill="#56AB7B"/>
-    <circle cx="302" cy="237" r="11" fill="#56AB7B"/>
-    <!-- nose -->
-    <ellipse cx="256" cy="300" rx="19" ry="14" fill="#123026"/>
+    <!-- head + rounded corner ears, one continuous silhouette -->
+    <path d="M136 252
+             C130 198 138 168 154 158
+             C142 118 148 76 162 66
+             C176 80 202 128 214 160
+             C234 150 278 150 296 160
+             C310 128 336 80 350 66
+             C364 76 370 118 356 158
+             C374 168 382 198 376 252
+             C376 324 320 382 256 382
+             C192 382 136 324 136 252 Z" fill="#56AB7B"/>
+    <!-- inner ears: same pointed shape as the outer ear, scaled down -->
+    <path d="M163 147 C158 120 160 102 168 91 C178 104 194 128 199 147 Z" fill="#123026"/>
+    <path d="M349 147 C354 120 352 102 344 91 C334 104 318 128 313 147 Z" fill="#123026"/>
+    <!-- bandit mask band -->
+    <path d="M148 248 Q150 210 202 210 Q256 214 310 210 Q362 210 364 248
+             Q362 288 306 290 Q256 298 206 290 Q150 288 148 248 Z" fill="#123026"/>
+    <!-- forehead blaze: green wedge splitting the mask -->
+    <path d="M242 210 L270 210 L256 262 Z" fill="#56AB7B"/>
+    <!-- almond eyes (pale) angled outward, with dark pupils -->
+    <ellipse cx="196" cy="250" rx="33" ry="19" fill="#56AB7B" transform="rotate(18 196 250)"/>
+    <ellipse cx="316" cy="250" rx="33" ry="19" fill="#56AB7B" transform="rotate(-18 316 250)"/>
+    <circle cx="194" cy="250" r="9" fill="#0B1712"/>
+    <circle cx="318" cy="250" r="9" fill="#0B1712"/>
+    <circle cx="197" cy="246" r="3" fill="#DCF1E6"/>
+    <circle cx="321" cy="246" r="3" fill="#DCF1E6"/>
+    <!-- heart nose on the muzzle -->
+    <path d="M236 302 Q256 294 276 302 Q270 330 256 340 Q242 330 236 302 Z" fill="#0B1712"/>
   </g>
 </svg>
