@@ -13,20 +13,48 @@
   </defs>
   <g clip-path="url(#tile)"><rect x="16" y="16" width="480" height="480" fill="url(#argyle)"/></g>
   <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#2BD3D3" stroke-width="6"/>
-  <!-- Raccoon face silhouette: solid pointed ears, muzzle bump, signature horizontal bandit mask. -->
+  <!-- Raccoon face. Head + ears are ONE continuous silhouette (ears flow into the
+       head — no side gaps), then the mask, eyes, nose and whiskers sit on top. -->
   <g>
-    <!-- solid pointed ears -->
-    <polygon points="150,152 216,146 172,74" fill="#56AB7B"/>
-    <polygon points="362,152 296,146 340,74" fill="#56AB7B"/>
-    <!-- head + muzzle -->
-    <ellipse cx="256" cy="238" rx="120" ry="106" fill="#56AB7B"/>
-    <ellipse cx="256" cy="304" rx="54" ry="48" fill="#56AB7B"/>
-    <!-- bandit mask band across the eyes -->
-    <rect x="172" y="210" width="168" height="54" rx="27" fill="#123026"/>
-    <!-- eyes inside the mask -->
-    <circle cx="210" cy="237" r="11" fill="#56AB7B"/>
-    <circle cx="302" cy="237" r="11" fill="#56AB7B"/>
-    <!-- nose -->
-    <ellipse cx="256" cy="300" rx="19" ry="14" fill="#123026"/>
+    <!-- fluffy cheeks (widen the lower face) -->
+    <circle cx="150" cy="272" r="36" fill="#56AB7B"/>
+    <circle cx="362" cy="272" r="36" fill="#56AB7B"/>
+    <!-- unified head + ears silhouette -->
+    <path d="M150 252
+             C144 212 148 184 156 172
+             C152 128 166 98 184 98
+             C198 98 206 132 212 168
+             C230 160 282 160 300 168
+             C306 132 314 98 328 98
+             C346 98 360 128 356 172
+             C364 184 368 212 362 252
+             C362 322 320 360 256 360
+             C192 360 150 322 150 252 Z" fill="#56AB7B"/>
+    <!-- muzzle -->
+    <ellipse cx="256" cy="316" rx="52" ry="44" fill="#56AB7B"/>
+    <!-- inner ears -->
+    <path d="M170 168 C170 140 178 122 186 120 C196 122 202 142 200 168 Z" fill="#123026"/>
+    <path d="M342 168 C342 140 334 122 326 120 C316 122 310 142 312 168 Z" fill="#123026"/>
+    <!-- whiskers -->
+    <g stroke="#C7E9D8" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.75">
+      <path d="M232 306 Q192 294 146 298"/>
+      <path d="M234 314 Q194 314 142 318"/>
+      <path d="M232 322 Q192 328 148 336"/>
+      <path d="M280 306 Q320 294 366 298"/>
+      <path d="M278 314 Q318 314 370 318"/>
+      <path d="M280 322 Q320 328 364 336"/>
+    </g>
+    <!-- the mask: twin eye-patches + a bridge funnelling to the nose, split by a
+         pale blaze up the centre of the forehead -->
+    <ellipse cx="208" cy="238" rx="34" ry="30" fill="#123026"/>
+    <ellipse cx="304" cy="238" rx="34" ry="30" fill="#123026"/>
+    <path d="M226 252 Q256 246 286 252 Q276 298 256 304 Q236 298 226 252 Z" fill="#123026"/>
+    <!-- eyes within the mask -->
+    <circle cx="208" cy="240" r="12" fill="#0B1712"/>
+    <circle cx="304" cy="240" r="12" fill="#0B1712"/>
+    <circle cx="212" cy="236" r="4" fill="#9BD4B4"/>
+    <circle cx="308" cy="236" r="4" fill="#9BD4B4"/>
+    <!-- dark nose at the muzzle tip -->
+    <path d="M240 304 Q256 297 272 304 Q270 324 256 332 Q242 324 240 304 Z" fill="#0B1712"/>
   </g>
 </svg>
