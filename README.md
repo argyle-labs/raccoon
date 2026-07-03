@@ -62,11 +62,29 @@ and reports drift as issues. Checks are distro-aware:
 Exit code: `0` all-OK, `1` any WARN, `2` any CRIT. `--repair` never runs `sudo`
 or restarts Steam — those fixes are printed with the exact command to run.
 
+## Tune from in-game metrics
+
+`tune.sh` reviews MangoHud frame logs and turns them into tuning findings —
+stutter, GPU/CPU-bound, thermal, uncapped fps — each with a concrete tweak.
+
+```bash
+./tune.sh enable         # point MangoHud at a log folder + show live 1%/0.1% low
+# play; toggle a capture during the rough patch with Shift_L+F2, then:
+./tune.sh analyze        # analyze the newest log (or pass a FILE)
+./tune.sh watch          # re-analyze the active log every few seconds (~live)
+./tune.sh --json analyze # machine-readable findings (Issue shape)
+```
+
+Target fps is taken from your refresh cap (falls back to 60); override with
+`TARGET_FPS=`. The overlay itself (Shift-R+F12) shows live 1% / 0.1% lows, so
+stutter is visible in the moment; `tune.sh` explains *why* and what to change.
+
 ## Repo layout
 
 ```
 bootstrap.sh                 # distro-detecting installer + config applier (--timer)
 doctor.sh                    # drift check + repair for the gaming setup
+tune.sh                      # review MangoHud metrics -> tuning suggestions
 scripts/                     # individual, re-runnable setup scripts
 configs/                     # drop-in config files (env.d, MangoHud, udev)
 systemd/                     # optional daily doctor timer (user)

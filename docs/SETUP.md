@@ -150,6 +150,26 @@ the per-game lock list in `doctor.sh` (`check_locked_game_files`) as §7 grows.
 
 ---
 
+## 9. Tune from in-game metrics
+When a game feels rough (stutter, low fps), let the frame data say why instead
+of guessing. MangoHud logs every frame; `tune.sh` reads the log and reports
+findings with concrete tweaks.
+
+```bash
+./tune.sh enable      # sets output_folder + live 1%/0.1% low in the overlay
+# In-game: Shift_R+F12 shows the overlay; Shift_L+F2 starts/stops a capture.
+# Toggle a capture ON during the rough patch, OFF after ~30-60s, then:
+./tune.sh analyze     # newest log; or `./tune.sh watch` for a live rolling read
+```
+
+It separates **stutter** (high p99 frametime / spikes — hitching) from **low
+average fps** (GPU- or CPU-bound) from **thermal throttling**, because the fix
+differs. See [docs/NOTES.md](NOTES.md) → "Diagnosing stutter" for what each
+finding means and the DBH example. `--json` emits the same findings in the
+Issue shape for orca.
+
+---
+
 ## Restore checklist (fresh machine)
 1. Base packages (§0) → Proton-GE (§1)
 2. `./bootstrap.sh` (applies configs)
@@ -159,3 +179,4 @@ the per-game lock list in `doctor.sh` (`check_locked_game_files`) as §7 grows.
 6. Controller wake (§6); MangoHud (§5)
 7. Re-apply per-game fixes (§7)
 8. `./doctor.sh` — confirm everything is green (§8)
+9. Tune per-game from metrics as needed (§9)

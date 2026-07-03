@@ -50,11 +50,25 @@ check_mangohud() {
   if [ ! -f "$dst" ]; then
     issue mangohud WARN "MangoHud overlay config missing" "no ${dst/#$HOME/\~}" \
       "install -Dm644 '$src' '$dst'" 1
-  elif ! cmp -s "$src" "$dst"; then
-    issue mangohud WARN "MangoHud config drifted from repo" "${dst/#$HOME/\~} differs from known-good" \
+  # Compare ignoring output_folder= (set per-machine by tune.sh, expected to differ).
+  elif ! diff -q <(grep -v '^output_folder=' "$src") <(grep -v '^output_folder=' "$dst") >/dev/null; then
+    issue mangohud WARN "MangoHud config drifted from repo" "${dst/#$HOME/\~} differs from known-good (ignoring output_folder)" \
       "install -Dm644 '$src' '$dst'" 1
   else
-    issue mangohud OK "MangoHud config in place" "matches repo"
+    issue mangohud OK "MangoHud config in place" "matches repo (output_folder machine-local)"
+  fi
+}
+
+check_gamescope_hdr() {
+  case "$(distro)" in *bazzite*|*fedora*) ;; *) return 0 ;; esac
+  local f="$HOME/.config/environment.d/15-gamescope-hdr.conf"
+  if [ -f "$f" ] && grep -q '^ENABLE_GAMESCOPE_HDR=1' "$f"; then
+    issue gamescope-hdr OK "HDR wired for Gaming Mode" "ENABLE_GAMESCOPE_HDR set (AMD needs this manually)"
+  else
+    # Not an error on SDR panels - informational, with the fix if they want HDR.
+    issue gamescope-hdr INFO "HDR not forced on" \
+      "on AMD, gamescope-session won't set ENABLE_GAMESCOPE_HDR itself; enable if your panel supports HDR" \
+      "$HERE/scripts/setup-gamescope-refresh.sh" 1
   fi
 }
 
@@ -199,6 +213,7 @@ run_checks() {
   check_locked_game_files
   # Bazzite / Fedora atomic
   check_gamescope_refresh
+  check_gamescope_hdr
   check_flathub_remote
   # CachyOS / Arch
   check_aur_helper
@@ -230,12 +245,16 @@ emit_report() {
     IFS='|' read -r id sev title detail repair auto <<<"$i"
     case "$sev" in
       OK)   printf '  \033[32mOK\033[0m   %s\n' "$title" ;;
+      INFO) printf '  \033[36mINFO\033[0m %s\n       %s\n' "$title" "$detail" ;;
       WARN) printf '  \033[33mWARN\033[0m %s\n       %s\n' "$title" "$detail"; n_warn=$((n_warn+1)) ;;
       CRIT) printf '  \033[31mCRIT\033[0m %s\n       %s\n' "$title" "$detail"; n_crit=$((n_crit+1)) ;;
     esac
-    if [ "$sev" != OK ] && [ -n "$repair" ]; then
+    # INFO carries an optional hint but is never auto-repaired; only WARN/CRIT.
+    if { [ "$sev" = WARN ] || [ "$sev" = CRIT ]; } && [ -n "$repair" ]; then
       if [ "$auto" = 1 ]; then printf '       fix: %s   (./doctor.sh --repair)\n' "$repair"
       else printf '       fix: %s\n' "$repair"; fi
+    elif [ "$sev" = INFO ] && [ -n "$repair" ]; then
+      printf '       enable: %s\n' "$repair"
     fi
   done
   echo
@@ -246,11 +265,11 @@ do_repair() {
   local i id sev title detail repair auto ran=0
   for i in "${ISSUES[@]}"; do
     IFS='|' read -r id sev title detail repair auto <<<"$i"
-    if [ "$sev" != OK ] && [ -n "$repair" ] && [ "$auto" = 1 ]; then
+    if { [ "$sev" = WARN ] || [ "$sev" = CRIT ]; } && [ -n "$repair" ] && [ "$auto" = 1 ]; then
       echo ">> repairing [$id]: $repair"
       bash -c "$repair" || echo "   !! repair failed for $id"
       ran=$((ran+1))
-    elif [ "$sev" != OK ] && [ -n "$repair" ]; then
+    elif { [ "$sev" = WARN ] || [ "$sev" = CRIT ]; } && [ -n "$repair" ]; then
       echo ">> [$id] needs manual/privileged fix: $repair"
     fi
   done
