@@ -65,7 +65,8 @@ or restarts Steam — those fixes are printed with the exact command to run.
 ## Tune from in-game metrics
 
 `tune.sh` reviews MangoHud frame logs and turns them into tuning findings —
-stutter, GPU/CPU-bound, thermal, uncapped fps — each with a concrete tweak.
+stutter, GPU/CPU-bound, thermal, VRAM-exhaustion, uncapped fps — each with a
+concrete tweak.
 
 ```bash
 ./tune.sh enable         # point MangoHud at a log folder + show live 1%/0.1% low

@@ -49,6 +49,22 @@ cmd_enable() {
   echo ">> then:    ./tune.sh analyze     (or ./tune.sh watch for live)"
 }
 
+# Total VRAM in MB. MangoHud logs *used* only, so read capacity from the driver.
+# AMD/Intel expose it in sysfs; NVIDIA via nvidia-smi. 0 = unknown (skip check).
+gpu_vram_total_mb() {
+  if [ -n "${VRAM_TOTAL_MB:-}" ]; then echo "$VRAM_TOTAL_MB"; return; fi
+  local f b
+  for f in /sys/class/drm/card*/device/mem_info_vram_total; do
+    [ -r "$f" ] || continue
+    b="$(cat "$f" 2>/dev/null)" || continue
+    [ -n "$b" ] && { echo $(( b / 1024 / 1024 )); return; }
+  done
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' && return
+  fi
+  echo 0
+}
+
 newest_log() {
   [ -d "$LOGDIR" ] || return 1
   find "$LOGDIR" -maxdepth 1 -name '*.csv' -printf '%T@ %p\n' 2>/dev/null \
@@ -64,18 +80,19 @@ metrics_of() {
   [ -n "$hln" ] || { echo "SAMPLES=0"; return 0; }
   local hdr; hdr="$(sed -n "${hln}p" "$f")"
   idx_of() { echo "$hdr" | awk -F',' -v n="$1" '{for(i=1;i<=NF;i++){g=$i;gsub(/^ +| +$/,"",g);if(g==n){print i;exit}}}'; }
-  local cf cft ccpu cgpu cct cgt cpow
+  local cf cft ccpu cgpu cct cgt cpow cvram
   cf="$(idx_of fps)"; cft="$(idx_of frametime)"; ccpu="$(idx_of cpu_load)"; cgpu="$(idx_of gpu_load)"
-  cct="$(idx_of cpu_temp)"; cgt="$(idx_of gpu_temp)"; cpow="$(idx_of gpu_power)"
-  : "${cf:=1}" "${cft:=2}" "${ccpu:=0}" "${cgpu:=0}" "${cct:=0}" "${cgt:=0}" "${cpow:=0}"
+  cct="$(idx_of cpu_temp)"; cgt="$(idx_of gpu_temp)"; cpow="$(idx_of gpu_power)"; cvram="$(idx_of gpu_vram_used)"
+  : "${cf:=1}" "${cft:=2}" "${ccpu:=0}" "${cgpu:=0}" "${cct:=0}" "${cgt:=0}" "${cpow:=0}" "${cvram:=0}"
 
   # Averages / maxima in one awk pass.
   awk -F',' -v s="$hln" -v cf="$cf" -v cft="$cft" -v ccpu="$ccpu" -v cgpu="$cgpu" \
-            -v cct="$cct" -v cgt="$cgt" -v cpow="$cpow" '
+            -v cct="$cct" -v cgt="$cgt" -v cpow="$cpow" -v cvram="$cvram" '
     NR>s && $cf ~ /^[0-9]/ {
       n++; fps+=$cf; ft+=$cft;
       if(ccpu)cpu+=$ccpu; if(cgpu)gpu+=$cgpu; if(cpow)pow+=$cpow;
       if(cct && $cct>ctm)ctm=$cct; if(cgt && $cgt>gtm)gtm=$cgt;
+      if(cvram && $cvram>vram)vram=$cvram;
       # frametime spikes: frame > 2x the running mean once we have a baseline
       if(n>30){ m=ft/n; if($cft > 2*m) spikes++ }
     }
@@ -89,6 +106,7 @@ metrics_of() {
       printf "CT_MAX=%.0f\n", ctm;
       printf "GT_MAX=%.0f\n", gtm;
       printf "POW_AVG=%.0f\n", (cpow? pow/n : 0);
+      printf "VRAM_MAX=%.0f\n", vram;
       printf "SPIKES=%d\n", spikes;
     }' "$f"
 
@@ -133,6 +151,14 @@ evaluate() { # consumes the KEY=VALUE metrics already eval'd into scope
       "Cap background work; enable gamemode (CPU governor -> performance); lower CPU-heavy settings (crowd/physics/draw distance); check for a single pinned core (bad thread scaling)"
   fi
 
+  # VRAM exhaustion: used near capacity -> texture streaming hitches / evictions.
+  if [ "${VRAM_TOTAL_MB:-0}" -gt 0 ] && [ "${VRAM_MAX:-0}" -gt 0 ] \
+     && awk -v u="${VRAM_MAX:-0}" -v t="${VRAM_TOTAL_MB:-1}" 'BEGIN{exit !(u > 0.90*t)}'; then
+    finding vram WARN "VRAM near capacity" \
+      "peak ${VRAM_MAX}MB of ${VRAM_TOTAL_MB}MB - texture streaming stalls/evictions show up as stutter" \
+      "Lower texture resolution / texture pool; disable/-reduce RT; drop render resolution (FSR); close other GPU apps (browser, wallpaper engine)"
+  fi
+
   # Thermal: GPU running hot enough to throttle.
   if [ "${GT_MAX:-0}" -ge 84 ]; then
     finding thermal WARN "GPU thermals high" \
@@ -158,8 +184,8 @@ evaluate() { # consumes the KEY=VALUE metrics already eval'd into scope
 json_escape() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
 emit() {
   if [ "$JSON" = 1 ]; then
-    printf '{"file":"%s","target_fps":%s,"metrics":{"fps_avg":%s,"fps_1low":%s,"ft_p99":%s,"gpu_avg":%s,"cpu_avg":%s,"gt_max":%s,"samples":%s},"findings":[' \
-      "$(json_escape "${1:-}")" "$TARGET_FPS" "${FPS_AVG:-0}" "${FPS_1LOW:-0}" "${FT_P99:-0}" "${GPU_AVG:-0}" "${CPU_AVG:-0}" "${GT_MAX:-0}" "${SAMPLES:-0}"
+    printf '{"file":"%s","target_fps":%s,"metrics":{"fps_avg":%s,"fps_1low":%s,"ft_p99":%s,"gpu_avg":%s,"cpu_avg":%s,"gt_max":%s,"vram_max_mb":%s,"vram_total_mb":%s,"samples":%s},"findings":[' \
+      "$(json_escape "${1:-}")" "$TARGET_FPS" "${FPS_AVG:-0}" "${FPS_1LOW:-0}" "${FT_P99:-0}" "${GPU_AVG:-0}" "${CPU_AVG:-0}" "${GT_MAX:-0}" "${VRAM_MAX:-0}" "${VRAM_TOTAL_MB:-0}" "${SAMPLES:-0}"
     local first=1 x id sev title detail tweak
     for x in "${FINDINGS[@]}"; do
       IFS='|' read -r id sev title detail tweak <<<"$x"
@@ -170,8 +196,9 @@ emit() {
     printf ']}\n'
   else
     printf '== %s\n' "${1:-(log)}"
-    printf '   %s fps avg | %s 1%% low | p99 frametime %sms | gpu %s%% cpu %s%% | gpu %sC | %s samples | target %s\n' \
-      "${FPS_AVG:-?}" "${FPS_1LOW:-?}" "${FT_P99:-?}" "${GPU_AVG:-?}" "${CPU_AVG:-?}" "${GT_MAX:-?}" "${SAMPLES:-0}" "$TARGET_FPS"
+    printf '   %s fps avg | %s 1%% low | p99 frametime %sms | gpu %s%% cpu %s%% | gpu %sC | vram %s/%sMB | %s samples | target %s\n' \
+      "${FPS_AVG:-?}" "${FPS_1LOW:-?}" "${FT_P99:-?}" "${GPU_AVG:-?}" "${CPU_AVG:-?}" "${GT_MAX:-?}" \
+      "${VRAM_MAX:-?}" "${VRAM_TOTAL_MB:-?}" "${SAMPLES:-0}" "$TARGET_FPS"
     echo
     local x id sev title detail tweak
     for x in "${FINDINGS[@]}"; do
@@ -193,6 +220,7 @@ analyze_one() { # $1=file
   # shellcheck disable=SC2046  # KEY=VALUE lines are trusted (from our own awk)
   eval "$(metrics_of "$f")"
   if [ "${SAMPLES:-0}" -eq 0 ]; then echo "no frame samples in $f"; exit 1; fi
+  VRAM_TOTAL_MB="$(gpu_vram_total_mb)"
   evaluate
   emit "$f"
 }

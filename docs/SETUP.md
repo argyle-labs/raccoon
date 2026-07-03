@@ -163,8 +163,9 @@ findings with concrete tweaks.
 ```
 
 It separates **stutter** (high p99 frametime / spikes — hitching) from **low
-average fps** (GPU- or CPU-bound) from **thermal throttling**, because the fix
-differs. See [docs/NOTES.md](NOTES.md) → "Diagnosing stutter" for what each
+average fps** (GPU- or CPU-bound) from **thermal throttling** from **VRAM
+exhaustion** (peak used vs the card's capacity, read from the driver), because
+the fix differs. See [docs/NOTES.md](NOTES.md) → "Diagnosing stutter" for what each
 finding means and the DBH example. `--json` emits the same findings in the
 Issue shape for orca.
 
