@@ -101,6 +101,71 @@ check_launchers() {
   fi
 }
 
+check_steam() {
+  # Native binary or Flatpak - either counts. Steam is the hub everything feeds.
+  if command -v steam >/dev/null 2>&1; then
+    issue steam OK "Steam installed" "native binary on PATH"
+  elif command -v flatpak >/dev/null && flatpak info com.valvesoftware.Steam >/dev/null 2>&1; then
+    issue steam OK "Steam installed" "Flatpak (com.valvesoftware.Steam)"
+  else
+    issue steam CRIT "Steam not found" "no native or Flatpak Steam; the whole library hub is missing"
+  fi
+}
+
+check_umu() {
+  # umu-launcher backs NSL/Battle.net. Bazzite ships it; CachyOS installs it.
+  if command -v umu-run >/dev/null 2>&1; then
+    issue umu OK "umu-launcher present" "NSL/Battle.net path available"
+  else
+    case "$(distro)" in
+      *cachyos*|*arch*) issue umu WARN "umu-launcher missing" \
+        "needed for NSL/Battle.net launchers" "sudo pacman -S --needed umu-launcher" 0 ;;
+      *) issue umu WARN "umu-launcher missing" \
+        "needed for NSL/Battle.net launchers; normally preinstalled on Bazzite" "" ;;
+    esac
+  fi
+}
+
+# --- CachyOS / Arch specific -------------------------------------------------
+check_aur_helper() {
+  case "$(distro)" in *cachyos*|*arch*) ;; *) return 0 ;; esac
+  if command -v paru >/dev/null 2>&1 || command -v yay >/dev/null 2>&1; then
+    issue aur-helper OK "AUR helper present" "paru/yay available for foreign pkgs"
+  else
+    issue aur-helper WARN "No AUR helper (paru/yay)" \
+      "restoring foreign/AUR packages (beaver pacman-aur.txt) needs one" \
+      "sudo pacman -S --needed paru" 0
+  fi
+}
+
+check_btrfs_snapshots() {
+  case "$(distro)" in *cachyos*|*arch*) ;; *) return 0 ;; esac
+  # Only relevant on a btrfs root, where instant local rollback is possible.
+  local fstype; fstype="$(findmnt -no FSTYPE / 2>/dev/null || echo '')"
+  [ "$fstype" = btrfs ] || return 0
+  if command -v snapper >/dev/null 2>&1 && snapper list-configs 2>/dev/null | grep -q '^root'; then
+    issue btrfs-snapshots OK "Local snapshots configured" "snapper 'root' config present"
+  elif command -v timeshift >/dev/null 2>&1; then
+    issue btrfs-snapshots OK "Local snapshots configured" "timeshift installed"
+  else
+    issue btrfs-snapshots WARN "No local btrfs snapshots" \
+      "btrfs root with no snapper/timeshift; off-box restic (beaver) still covers you, but instant rollback isn't set up" \
+      "sudo pacman -S --needed snapper" 0
+  fi
+}
+
+# --- Bazzite / Fedora atomic specific ----------------------------------------
+check_flathub_remote() {
+  case "$(distro)" in *bazzite*|*fedora*) ;; *) return 0 ;; esac
+  command -v flatpak >/dev/null || return 0
+  if flatpak remotes --columns=name 2>/dev/null | grep -qx flathub; then
+    issue flathub OK "Flathub remote configured" "launchers installable via Flatpak"
+  else
+    issue flathub WARN "Flathub remote missing" "launchers (Heroic/Lutris) can't install without it" \
+      "flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo" 1
+  fi
+}
+
 # Per-game locks: files we chmod 444 so the game can't overwrite our tweak.
 # Format: <path>|<label>. Extend as per-game fixes accrue (see docs/SETUP.md §7).
 check_locked_game_files() {
@@ -123,13 +188,21 @@ check_locked_game_files() {
 }
 
 run_checks() {
-  check_gamescope_refresh
-  check_mangohud
+  # cross-distro
+  check_steam
+  check_launchers
+  check_umu
   check_ge_proton
+  check_mangohud
   check_controller_wake
   check_nsl_scanner
-  check_launchers
   check_locked_game_files
+  # Bazzite / Fedora atomic
+  check_gamescope_refresh
+  check_flathub_remote
+  # CachyOS / Arch
+  check_aur_helper
+  check_btrfs_snapshots
 }
 
 # --- output ------------------------------------------------------------------

@@ -45,8 +45,12 @@ Then per-component (see [docs/SETUP.md](docs/SETUP.md) for the full runbook):
 ## Diagnose & repair
 
 `doctor.sh` compares this repo's known-good config against what's actually live
-and reports drift as issues (gamescope refresh cap, MangoHud config, GE-Proton,
-controller wake, NSL scanner, per-game locks):
+and reports drift as issues. Checks are distro-aware:
+
+- **Cross-distro:** Steam present, Heroic, umu-launcher, GE-Proton, MangoHud
+  config, controller USB-wake, NSL game scanner, per-game locks.
+- **Bazzite:** gamescope high-refresh env, Flathub remote configured.
+- **CachyOS:** AUR helper (paru/yay) present, local btrfs snapshots (snapper/timeshift).
 
 ```bash
 ./doctor.sh              # human-readable report (read-only)
