@@ -5,10 +5,22 @@
 #
 # Does NOT log you into anything or install games (those are interactive) and
 # does NOT run NSL (it restarts Steam) - run scripts/install-blizzard.sh for that.
+#   ./bootstrap.sh --timer   also install + enable a daily doctor (drift-check) timer
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# shellcheck source=/dev/null
 distro() { [ -r /etc/os-release ] && . /etc/os-release && echo "${ID:-} ${ID_LIKE:-}"; }
+
+install_timer() {
+  echo "== Installing daily doctor timer (user)"
+  mkdir -p "$HOME/.config/systemd/user"
+  sed "s#@HERE@#$HERE#g" "$HERE/systemd/raccoon-doctor.service" > "$HOME/.config/systemd/user/raccoon-doctor.service"
+  install -m644 "$HERE/systemd/raccoon-doctor.timer" "$HOME/.config/systemd/user/raccoon-doctor.timer"
+  systemctl --user daemon-reload
+  systemctl --user enable --now raccoon-doctor.timer
+  echo "   enabled: $(systemctl --user is-enabled raccoon-doctor.timer)  (journalctl --user -u raccoon-doctor)"
+}
 
 flatpaks() {
   command -v flatpak >/dev/null || { echo "!! flatpak not found; skipping launchers"; return; }
@@ -38,6 +50,8 @@ echo "== Applying drop-in configs"
 install -Dm644 "$HERE/configs/MangoHud/MangoHud.conf"               "$HOME/.config/MangoHud/MangoHud.conf"
 install -Dm644 "$HERE/configs/environment.d/10-gamescope-refresh.conf" "$HOME/.config/environment.d/10-gamescope-refresh.conf"
 echo "   -> MangoHud + gamescope refresh env installed (restart Gaming Mode to apply refresh)"
+
+[ "${1:-}" = "--timer" ] && install_timer
 
 echo
 echo "== Next (interactive / privileged):"

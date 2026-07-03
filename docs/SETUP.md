@@ -133,6 +133,23 @@ Some games need a tweak. Keep them here as you find them.
 
 ---
 
+## 8. Diagnose & repair (drift check)
+Over time a config can drift — Gaming Mode resets the refresh env, a game
+rewrites a file you'd locked, GE-Proton goes missing. `doctor.sh` checks the
+live machine against this repo's known-good state and reports each gap:
+
+```bash
+./doctor.sh              # report (read-only)
+./doctor.sh --repair     # re-apply the safe fixes (no sudo, no Steam restart)
+./bootstrap.sh --timer   # run it daily via a systemd --user timer (journal)
+```
+
+Each issue names the exact repair command. Privileged fixes (e.g. controller
+wake, which needs `sudo`) are **printed, not auto-run** — you apply them. Extend
+the per-game lock list in `doctor.sh` (`check_locked_game_files`) as §7 grows.
+
+---
+
 ## Restore checklist (fresh machine)
 1. Base packages (§0) → Proton-GE (§1)
 2. `./bootstrap.sh` (applies configs)
@@ -141,3 +158,4 @@ Some games need a tweak. Keep them here as you find them.
 5. Gaming Mode display (§4) + restart Gaming Mode
 6. Controller wake (§6); MangoHud (§5)
 7. Re-apply per-game fixes (§7)
+8. `./doctor.sh` — confirm everything is green (§8)
