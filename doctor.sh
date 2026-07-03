@@ -23,6 +23,8 @@ esac
 
 # shellcheck source=/dev/null
 distro() { [ -r /etc/os-release ] && . /etc/os-release && echo "${ID:-} ${ID_LIKE:-}"; }
+# shellcheck source=lib/settings.sh
+[ -f "$HERE/lib/settings.sh" ] && . "$HERE/lib/settings.sh"
 
 # --- issue accumulator -------------------------------------------------------
 # Each issue: id | severity(OK|WARN|CRIT) | title | detail | repair-cmd | automatic(0|1)
@@ -180,6 +182,34 @@ check_flathub_remote() {
   fi
 }
 
+# Does the live display config match this machine's orca target (display:target)?
+# The machine owns its goal (bragi 4K@120, hemlock 1440p@144); this checks the
+# box is actually set up to chase it. Silent when orca has no target for the host.
+check_display_target() {
+  command -v orca_setting >/dev/null 2>&1 || return 0
+  local w h r hdr; w="$(orca_setting display target width)"; h="$(orca_setting display target height)"
+  r="$(orca_setting display target refresh)"; hdr="$(orca_setting display target hdr)"
+  [ -n "$r" ] || return 0   # no target configured for this host - nothing to check
+  local label="${w}x${h}@${r}"; [ "$hdr" = True ] && label="$label HDR"
+  case "$(distro)" in *bazzite*|*fedora*) ;; *)
+    issue display-target INFO "Machine target: $label" "orca display:target (set gamescope output to match)"; return 0 ;;
+  esac
+  local modes="$HOME/.config/gamescope/modes.cfg" refenv="$HOME/.config/environment.d/10-gamescope-refresh.conf"
+  local ok=1 detail=""
+  if ! { [ -f "$modes" ] && grep -q "${w}x${h}@${r}" "$modes"; }; then
+    ok=0; detail="gamescope modes.cfg not forcing ${w}x${h}@${r}"
+  fi
+  if ! { [ -f "$refenv" ] && grep -q "^CUSTOM_REFRESH_RATES=.*\b${r}\b" "$refenv"; }; then
+    ok=0; detail="${detail:+$detail; }refresh env doesn't expose ${r}Hz"
+  fi
+  if [ "$ok" = 1 ]; then
+    issue display-target OK "Display matches machine target" "$label"
+  else
+    issue display-target WARN "Display not set to machine target ($label)" \
+      "$detail" "Gaming Mode -> Display: set ${w}x${h}@${r}; $HERE/scripts/setup-gamescope-refresh.sh" 0
+  fi
+}
+
 # Per-game locks: files we chmod 444 so the game can't overwrite our tweak.
 # Format: <path>|<label>. Extend as per-game fixes accrue (see docs/SETUP.md §7).
 check_locked_game_files() {
@@ -211,6 +241,8 @@ run_checks() {
   check_controller_wake
   check_nsl_scanner
   check_locked_game_files
+  # machine target (orca display:target)
+  check_display_target
   # Bazzite / Fedora atomic
   check_gamescope_refresh
   check_gamescope_hdr

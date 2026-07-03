@@ -14,6 +14,8 @@
 # Shift_L+F2 during the rough patch, toggle off, then `./tune.sh analyze`.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/settings.sh
+[ -f "$HERE/lib/settings.sh" ] && . "$HERE/lib/settings.sh"
 
 JSON=0
 [ "${1:-}" = "--json" ] && { JSON=1; shift; }
@@ -23,8 +25,14 @@ LOGDIR="${MANGO_LOGDIR:-$HOME/.local/share/raccoon/mangohud-logs}"
 MANGO_CONF="$HOME/.config/MangoHud/MangoHud.conf"
 WATCH_INTERVAL="${WATCH_INTERVAL:-5}"
 
-# Target FPS: honor the refresh cap the box exposes, else 60.
+# Target FPS: prefer the machine's orca setting (display:target.refresh), then
+# the refresh cap the box exposes, else 60.
 default_target() {
+  local r
+  if command -v orca_setting >/dev/null 2>&1; then
+    r="$(orca_setting display target refresh)"
+    [ -n "$r" ] && { echo "$r"; return; }
+  fi
   local f="$HOME/.config/environment.d/10-gamescope-refresh.conf" max=60
   if [ -f "$f" ]; then
     max="$(grep '^CUSTOM_REFRESH_RATES=' "$f" 2>/dev/null | tr ',' '\n' | grep -Eo '[0-9]+' | sort -n | tail -1)"
@@ -33,6 +41,10 @@ default_target() {
   echo "$max"
 }
 TARGET_FPS="${TARGET_FPS:-$(default_target)}"
+# Target resolution + upscaler preference (from orca), for the report + tweaks.
+TARGET_W="$(orca_setting display target width 2>/dev/null || true)"
+TARGET_H="$(orca_setting display target height 2>/dev/null || true)"
+PREF_UPSCALER="$(orca_setting graphics prefs upscaler 2>/dev/null || true)"
 
 # --- enable ------------------------------------------------------------------
 cmd_enable() {
@@ -136,12 +148,14 @@ evaluate() { # consumes the KEY=VALUE metrics already eval'd into scope
       "Pre-compile shaders (DXVK_ASYNC/GE-Proton, let the shader-cache build); enable Steam 'gamescope' frame-limit to ${target}; enable gamemode; close the KDE compositor / background apps; put shader cache + game on fast NVMe"
   fi
 
-  # GPU-bound: GPU pinned but fps under target.
+  # GPU-bound: GPU pinned but fps under target. Name the machine's preferred
+  # upscaler (from graphics:prefs) so the tweak matches what this box uses.
   if [ -n "${GPU_AVG:-}" ] && [ "${GPU_AVG:-0}" -ge 95 ] \
      && awk -v f="${FPS_AVG:-0}" -v t="$target" 'BEGIN{exit !(f < 0.95*t)}'; then
+    local up="${PREF_UPSCALER:-FSR/upscaling}"
     finding gpu-bound WARN "GPU-bound below target" \
-      "gpu_load ${GPU_AVG}% avg, only ${FPS_AVG} fps vs ${target} target" \
-      "Enable FSR/upscaling or drop resolution; lower the heaviest settings (shadows, RT, volumetrics); cap fps to a steady number the GPU can hold"
+      "gpu_load ${GPU_AVG}% avg, only ${FPS_AVG} fps vs ${target} target${TARGET_W:+ at ${TARGET_W}x${TARGET_H}}" \
+      "Enable ${up} (this machine's upscaler) or drop resolution; lower the heaviest settings (shadows, RT, volumetrics); cap fps to a steady number the GPU can hold"
   fi
 
   # CPU-bound-ish: high avg CPU load while GPU has headroom.
@@ -196,9 +210,10 @@ emit() {
     printf ']}\n'
   else
     printf '== %s\n' "${1:-(log)}"
+    local tgt="$TARGET_FPS"; [ -n "${TARGET_W:-}" ] && tgt="${TARGET_W}x${TARGET_H}@${TARGET_FPS}${PREF_UPSCALER:+ ${PREF_UPSCALER}}"
     printf '   %s fps avg | %s 1%% low | p99 frametime %sms | gpu %s%% cpu %s%% | gpu %sC | vram %s/%sMB | %s samples | target %s\n' \
       "${FPS_AVG:-?}" "${FPS_1LOW:-?}" "${FT_P99:-?}" "${GPU_AVG:-?}" "${CPU_AVG:-?}" "${GT_MAX:-?}" \
-      "${VRAM_MAX:-?}" "${VRAM_TOTAL_MB:-?}" "${SAMPLES:-0}" "$TARGET_FPS"
+      "${VRAM_MAX:-?}" "${VRAM_TOTAL_MB:-?}" "${SAMPLES:-0}" "$tgt"
     echo
     local x id sev title detail tweak
     for x in "${FINDINGS[@]}"; do
