@@ -187,11 +187,56 @@ evaluate() { # consumes the KEY=VALUE metrics already eval'd into scope
       "Cap fps at ${target} (gamescope --framerate-limit / MangoHud fps_limit / in-game vsync) for steadier frametimes and cooler running"
   fi
 
+  # System-state correlations: settings that, when off, leave performance on the
+  # table - weighted by whether a live symptom above makes them matter right now.
+  evaluate_env
+
   # Nothing flagged.
   if [ "${#FINDINGS[@]}" -eq 0 ]; then
     finding ok OK "No tuning issues found" \
       "${FPS_AVG:-?} fps avg, ${FPS_1LOW:-?} 1% low, p99 frametime ${FT_P99:-?}ms over ${SAMPLES:-0} samples (target ${target})"
   fi
+}
+
+# Turn live system state into advice actionable right now. Kept here (not just in
+# doctor.sh) so `watch` can flag it in-game and weight it by the live symptom.
+evaluate_env() {
+  # sched_ext scheduler (scx_lavd) installed but disabled -> frame-pacing left on
+  # the table. WARN when we're CPU-bound/stuttering (lavd directly helps), else INFO.
+  if [ -d /sys/kernel/sched_ext ] \
+     && { command -v scx_loader >/dev/null 2>&1 || command -v scx_lavd >/dev/null 2>&1; } \
+     && [ "$(cat /sys/kernel/sched_ext/state 2>/dev/null || echo disabled)" != enabled ]; then
+    local sev=INFO
+    printf '%s\n' "${FINDINGS[@]}" | grep -qE '^(cpu-bound|stutter)\|' && sev=WARN
+    finding scx "$sev" "Scheduler not optimized (scx_lavd off)" \
+      "a game-tuned sched_ext scheduler is installed but disabled - lavd smooths 1% lows / frame pacing under load" \
+      "Enable it: 'ujust setup-scx' (Bazzite) or 'sudo systemctl enable --now scx_loader', then select lavd"
+  fi
+
+  # AMD GPU DPM stuck below auto/high -> GPU may not clock up for the game.
+  local f lvl=""
+  for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do
+    [ -r "$f" ] || continue; lvl="$(cat "$f" 2>/dev/null)"; break
+  done
+  if [ -n "$lvl" ] && [ "$lvl" != auto ] && [ "$lvl" != high ]; then
+    finding gpu-dpm WARN "GPU clocks capped (DPM=$lvl)" \
+      "power_dpm_force_performance_level is '$lvl', not auto/high - the GPU may not boost for the game" \
+      "Restore scaling: echo auto | sudo tee /sys/class/drm/card*/device/power_dpm_force_performance_level"
+  fi
+}
+
+# in-game toast: notify once per newly-appeared WARN finding (watch mode only).
+PREV_WARN=""
+notify_new_warns() {
+  command -v notify-send >/dev/null 2>&1 || return 0
+  local x id sev title detail tweak
+  for x in "${FINDINGS[@]}"; do
+    IFS='|' read -r id sev title detail tweak <<<"$x"
+    [ "$sev" = WARN ] || continue
+    case ",$PREV_WARN," in *",$id,"*) continue ;; esac    # already toasted this run
+    notify-send -u normal -a raccoon "raccoon: $title" "${detail}${tweak:+ - fix: $tweak}" 2>/dev/null || true
+  done
+  PREV_WARN="$(printf '%s\n' "${FINDINGS[@]}" | awk -F'|' '$2=="WARN"{printf "%s,",$1}')"
 }
 
 # --- output ------------------------------------------------------------------
@@ -249,10 +294,11 @@ case "$CMD" in
     ;;
   watch)
     echo ">> watching (${WATCH_INTERVAL}s); Ctrl-C to stop"
+    command -v notify-send >/dev/null 2>&1 && echo ">> new WARN findings toast via notify-send"
     while true; do
       f="${FILE:-$(newest_log || true)}"
       clear 2>/dev/null || true
-      if [ -n "$f" ] && [ -f "$f" ]; then analyze_one "$f" || true; else echo "waiting for a log in $LOGDIR ..."; fi
+      if [ -n "$f" ] && [ -f "$f" ]; then analyze_one "$f" || true; notify_new_warns; else echo "waiting for a log in $LOGDIR ..."; fi
       sleep "$WATCH_INTERVAL"
     done
     ;;

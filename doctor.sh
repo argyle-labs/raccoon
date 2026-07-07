@@ -117,6 +117,77 @@ check_cpu_mode() {
   fi
 }
 
+# --- gaming performance readiness (cross-distro) -----------------------------
+# These are the "set this and games run better" levers. Static/pre-game state;
+# tune.sh correlates them with live metrics for in-game advice.
+
+# sched_ext: a modern scheduler (scx_lavd) improves frame pacing / 1% lows under
+# load. Bazzite AND CachyOS ship scx but Bazzite leaves it off by default.
+check_scx() {
+  [ -d /sys/kernel/sched_ext ] || return 0          # kernel has no sched_ext - skip
+  command -v scx_loader >/dev/null 2>&1 || command -v scx_lavd >/dev/null 2>&1 || return 0
+  local state; state="$(cat /sys/kernel/sched_ext/state 2>/dev/null || echo unknown)"
+  if [ "$state" = enabled ]; then
+    local sched; sched="$(cat /sys/kernel/sched_ext/root/ops 2>/dev/null || true)"
+    issue scx OK "Modern scheduler active" "sched_ext '${sched:-scx}' running (better frame pacing)"
+  else
+    local fix="sudo systemctl enable --now scx_loader"
+    command -v ujust >/dev/null 2>&1 && fix="ujust setup-scx   # or: $fix (then select lavd)"
+    issue scx WARN "sched_ext available but off (scx_lavd)" \
+      "a game-tuned scheduler is installed but disabled; scx_lavd smooths 1% lows under load" \
+      "$fix" 0
+  fi
+}
+
+# AMD GPU DPM: 'auto' (default) lets clocks scale; a stuck 'low'/manual level
+# caps performance. 'high' is fine too (locks max). Only warn on low/manual.
+check_gpu_perf() {
+  local f lvl
+  for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do
+    [ -r "$f" ] || continue
+    lvl="$(cat "$f" 2>/dev/null)" || continue
+    case "$lvl" in
+      auto|high) issue gpu-perf OK "GPU performance level: $lvl" "clocks free to scale" ;;
+      *) issue gpu-perf WARN "GPU performance level: $lvl" \
+           "DPM not on auto/high - clocks may be capped below what games need" \
+           "echo auto | sudo tee $f" 0 ;;
+    esac
+    return 0
+  done
+}
+
+# Steam shader pre-caching: off => first-run shader compilation stutter. We can
+# see the manager in config.vdf; enabled when ShaderCacheManager block is present.
+check_shader_cache() {
+  local vdf
+  for vdf in "$HOME/.steam/steam/config/config.vdf" "$HOME/.local/share/Steam/config/config.vdf"; do
+    [ -f "$vdf" ] || continue
+    if grep -q 'ShaderCacheManager' "$vdf"; then
+      issue shader-cache OK "Shader pre-caching on" "Steam builds shader caches ahead of play (less first-run stutter)"
+    else
+      issue shader-cache WARN "Shader pre-caching may be off" \
+        "no ShaderCacheManager in Steam config - expect first-run shader-compile stutter" \
+        "Steam -> Settings -> Downloads -> enable 'Shader Pre-Caching'" 0
+    fi
+    return 0
+  done
+}
+
+# VRR / adaptive-sync: capable panels game much smoother with it on. We can read
+# capability from DRM but not reliably whether the compositor enabled it, so this
+# is an INFO nudge on capable, connected outputs (never a nag).
+check_vrr() {
+  local f cap conn
+  for f in /sys/class/drm/card*-*/vrr_capable; do
+    [ -r "$f" ] || continue
+    cap="$(cat "$f" 2>/dev/null)"; [ "$cap" = 1 ] || continue
+    conn="${f%/vrr_capable}"; [ "$(cat "$conn/status" 2>/dev/null)" = connected ] || continue
+    issue vrr INFO "Display is VRR-capable" \
+      "$(basename "$conn"): enable Adaptive Sync/VRR (Gaming Mode Display, or KDE Settings -> Display) to kill tearing/stutter"
+    return 0
+  done
+}
+
 check_gamescope_hdr() {
   case "$(distro)" in *bazzite*|*fedora*) ;; *) return 0 ;; esac
   local f="$HOME/.config/environment.d/15-gamescope-hdr.conf"
@@ -296,6 +367,11 @@ run_checks() {
   check_mangohud
   check_alsa_headroom
   check_cpu_mode
+  # gaming performance readiness
+  check_scx
+  check_gpu_perf
+  check_shader_cache
+  check_vrr
   check_controller_wake
   check_nsl_scanner
   check_locked_game_files
