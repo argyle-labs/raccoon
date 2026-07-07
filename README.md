@@ -40,6 +40,7 @@ Then per-component (see [docs/SETUP.md](docs/SETUP.md) for the full runbook):
 ./scripts/install-blizzard.sh        # Battle.net (+ optional EA/Ubisoft) via NSL
 ./scripts/setup-controller-wake.sh   # wake from sleep via USB controller (needs sudo)
 ./scripts/setup-gamescope-refresh.sh # Gaming Mode: expose up to 120Hz to all games (Bazzite)
+./scripts/cpu-mode.sh performance    # CPU power mode via orca power:cpu (performance|balanced|powersave)
 ```
 
 ## Diagnose & repair
@@ -48,7 +49,8 @@ Then per-component (see [docs/SETUP.md](docs/SETUP.md) for the full runbook):
 and reports drift as issues. Checks are distro-aware:
 
 - **Cross-distro:** Steam present, Heroic, umu-launcher, GE-Proton, MangoHud
-  config, controller USB-wake, NSL game scanner, per-game locks.
+  config, ALSA audio headroom (crackle/dropout fix), CPU power mode vs the
+  `power:cpu` orca setting, controller USB-wake, NSL game scanner, per-game locks.
 - **Bazzite:** gamescope high-refresh env, Flathub remote configured.
 - **CachyOS:** AUR helper (paru/yay) present, local btrfs snapshots (snapper/timeshift).
 
@@ -87,7 +89,7 @@ bootstrap.sh                 # distro-detecting installer + config applier (--ti
 doctor.sh                    # drift check + repair for the gaming setup
 tune.sh                      # review MangoHud metrics -> tuning suggestions
 scripts/                     # individual, re-runnable setup scripts
-configs/                     # drop-in config files (env.d, MangoHud, udev)
+configs/                     # drop-in config files (env.d, MangoHud, udev, wireplumber)
 systemd/                     # optional daily doctor timer (user)
 docs/SETUP.md                # full setup + restore runbook (Bazzite + CachyOS)
 docs/NOTES.md                # field notes / gotchas (Battle.net, umu, gamescope)

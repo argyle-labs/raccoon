@@ -116,6 +116,55 @@ shows via Quick Access (**Ctrl+2**) → Performance → Overlay level.
 
 ---
 
+## 5b. Audio — stop crackle / dropouts (ALSA headroom)
+Symptom: audio crackles or briefly cuts out during gameplay, worst on the GPU
+HDMI output. Cause: PipeWire defaults ALSA sinks to `api.alsa.headroom = 0`, so
+with a small negotiated quantum there is no slack — any late audio-thread wakeup
+(GPU under load, powersave CPU governor) underruns and you hear a click/gap.
+
+Fix is the WirePlumber drop-in `configs/wireplumber/51-alsa-headroom.conf`,
+which sets `api.alsa.headroom = 2048` (~43ms buffered ahead) on every ALSA sink.
+`bootstrap.sh` installs it to
+`~/.config/wireplumber/wireplumber.conf.d/51-alsa-headroom.conf` and restarts
+wireplumber. It is a user config file, so it **survives reboots** and reapplies
+on every login. Verify it's live:
+
+```
+pw-dump | grep -c '"api.alsa.headroom": 2048'     # one per ALSA sink
+timeout 6 pw-top -b -n 5 | grep hdmi              # ERR column should stay 0
+```
+
+`doctor.sh` checks both that the file matches the repo **and** that the running
+graph actually shows headroom applied (catches "installed but wireplumber not
+restarted"); `--repair` reinstalls and reloads.
+
+### CPU power mode (performance / balanced / powersave)
+A downclocking CPU is a secondary cause of crackle/stutter (late audio/frame
+wakeups under load). The desired mode is a **runtime orca setting** the machine
+owns — `power:cpu {mode}` — just like `display:target`. raccoon maps the mode to
+a real `tuned` profile (tuned owns the governor + EPP here — bragi is
+amd-pstate-epp — and persists the active profile across reboots, all cores):
+
+| mode | tuned profile | effect |
+|------|---------------|--------|
+| `performance` | `throughput-performance-bazzite` | max clocks — best for latency/audio/gaming |
+| `balanced`    | `balanced-bazzite`               | dynamic, slight perf bias |
+| `powersave`   | `powersave-bazzite`              | dynamic, biased to save power |
+
+```bash
+./scripts/cpu-mode.sh                 # show desired (orca) vs live (tuned)
+./scripts/cpu-mode.sh performance     # set orca value + apply (tuned-adm needs sudo)
+./scripts/cpu-mode.sh --apply         # apply whatever orca already says (doctor --repair uses this)
+# or set the value directly (no sudo; applies on next --apply / reboot enforcement):
+orca config set power cpu '{"mode":"performance"}'
+```
+
+`doctor.sh` reads the orca mode, compares it to the live tuned profile, and warns
+on drift with `sudo ./scripts/cpu-mode.sh --apply` as the (privileged) fix. If no
+mode is set for the host it stays quiet.
+
+---
+
 ## 6. Controller wake-from-sleep
 `./scripts/setup-controller-wake.sh` (needs sudo) installs
 `configs/udev/90-usb-wakeup.rules` and arms USB wake. **USB/dongle/wired only —

@@ -49,13 +49,16 @@ esac
 echo "== Applying drop-in configs"
 install -Dm644 "$HERE/configs/MangoHud/MangoHud.conf"               "$HOME/.config/MangoHud/MangoHud.conf"
 install -Dm644 "$HERE/configs/environment.d/10-gamescope-refresh.conf" "$HOME/.config/environment.d/10-gamescope-refresh.conf"
-echo "   -> MangoHud + gamescope refresh env installed (restart Gaming Mode to apply refresh)"
+install -Dm644 "$HERE/configs/wireplumber/51-alsa-headroom.conf"        "$HOME/.config/wireplumber/wireplumber.conf.d/51-alsa-headroom.conf"
+systemctl --user restart wireplumber 2>/dev/null || true   # reload so the audio headroom applies now
+echo "   -> MangoHud + gamescope refresh env + ALSA headroom (audio crackle fix) installed"
 
 [ "${1:-}" = "--timer" ] && install_timer
 
 echo
 echo "== Next (interactive / privileged):"
 echo "   sudo $HERE/scripts/setup-controller-wake.sh   # USB controller wake"
+echo "   $HERE/scripts/cpu-mode.sh performance          # CPU power mode (orca power:cpu); balanced|powersave too"
 echo "   $HERE/scripts/install-blizzard.sh             # Battle.net via NSL (restarts Steam)"
 echo "   Heroic: log in (Epic/GOG/Amazon), set GE-Proton + Add-to-Steam + HDR, install games"
 echo "   See docs/SETUP.md for the full runbook."

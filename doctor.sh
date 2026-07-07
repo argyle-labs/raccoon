@@ -61,6 +61,62 @@ check_mangohud() {
   fi
 }
 
+# Audio crackle/dropout fix: the WirePlumber ALSA-headroom drop-in must be in
+# place AND live. Two failure modes - the config file drifted/missing (auto-fix:
+# reinstall + reload wireplumber), or the file is present but the running graph
+# still shows headroom 0 (wireplumber wasn't restarted since install; same fix).
+check_alsa_headroom() {
+  local src="$HERE/configs/wireplumber/51-alsa-headroom.conf"
+  local dst="$HOME/.config/wireplumber/wireplumber.conf.d/51-alsa-headroom.conf"
+  local repair="install -Dm644 '$src' '$dst' && systemctl --user restart wireplumber"
+  if [ ! -f "$dst" ]; then
+    issue alsa-headroom WARN "Audio has no ALSA headroom (crackle/dropout risk)" \
+      "WirePlumber drop-in missing at ${dst/#$HOME/\~}; ALSA sinks run headroom=0 and underrun under load" \
+      "$repair" 1
+  elif ! diff -q "$src" "$dst" >/dev/null 2>&1; then
+    issue alsa-headroom WARN "ALSA headroom config drifted from repo" \
+      "${dst/#$HOME/\~} differs from known-good" "$repair" 1
+  # File is correct - confirm it's actually live in the running graph.
+  elif command -v pw-dump >/dev/null 2>&1 \
+       && pw-dump 2>/dev/null | grep -q '"api.alsa.headroom": 0'; then
+    issue alsa-headroom WARN "ALSA headroom config present but not applied" \
+      "a sink still reports headroom=0; wireplumber needs a restart to pick it up" \
+      "$repair" 1
+  else
+    issue alsa-headroom OK "Audio headroom applied" "ALSA sinks buffered against xruns (no crackle)"
+  fi
+}
+
+# CPU power mode: desired mode is a runtime orca setting (power:cpu {mode}); the
+# machine owns its goal like display:target. raccoon maps it to a tuned profile
+# (tuned owns governor+EPP here and persists the profile across reboots). Warn on
+# drift; the fix is privileged (sudo tuned-adm), so non-auto. Silent when orca
+# has no mode set for this host (nothing to enforce).
+check_cpu_mode() {
+  command -v tuned-adm >/dev/null 2>&1 || return 0
+  local mode; mode="$(orca_setting power cpu mode 2>/dev/null || true)"
+  [ -n "$mode" ] || { issue cpu-mode INFO "CPU power mode not managed by orca" \
+    "set one with: $HERE/scripts/cpu-mode.sh performance|balanced|powersave"; return 0; }
+  local base want live
+  case "$mode" in
+    performance) base=throughput-performance ;;
+    balanced)    base=balanced ;;
+    powersave)   base=powersave ;;
+    *) issue cpu-mode WARN "Unknown orca CPU mode '$mode'" \
+         "power:cpu.mode must be performance|balanced|powersave" \
+         "$HERE/scripts/cpu-mode.sh balanced" 0; return 0 ;;
+  esac
+  if tuned-adm list 2>/dev/null | grep -qE "^- ${base}-bazzite\b"; then want="${base}-bazzite"; else want="$base"; fi
+  live="$(tuned-adm active 2>/dev/null | sed -n 's/^Current active profile: //p')"
+  if [ "$live" = "$want" ]; then
+    issue cpu-mode OK "CPU mode: $mode" "tuned profile '$live' (orca-managed, all cores)"
+  else
+    issue cpu-mode WARN "CPU mode drifted (want $mode)" \
+      "orca wants '$mode' (tuned '$want') but live profile is '${live:-unknown}'" \
+      "sudo $HERE/scripts/cpu-mode.sh --apply" 0
+  fi
+}
+
 check_gamescope_hdr() {
   case "$(distro)" in *bazzite*|*fedora*) ;; *) return 0 ;; esac
   local f="$HOME/.config/environment.d/15-gamescope-hdr.conf"
@@ -238,6 +294,8 @@ run_checks() {
   check_umu
   check_ge_proton
   check_mangohud
+  check_alsa_headroom
+  check_cpu_mode
   check_controller_wake
   check_nsl_scanner
   check_locked_game_files
