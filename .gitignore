@@ -1,1 +1,4 @@
 *.bak
+
+/target
+Cargo.lock merge=binary

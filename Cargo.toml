@@ -1,0 +1,47 @@
+[package]
+name = "raccoon"
+version = "0.1.0"
+edition = "2024"
+description = "Gaming-box diagnostics/repair for orca — audio, CPU power mode, scheduler, GPU, shader cache (Bazzite/CachyOS)"
+
+[package.metadata.orca]
+category = "gaming"
+
+[lib]
+name = "raccoon"
+path = "src/lib.rs"
+# `cdylib` is the orca plugin artifact orca's `plugin-loader` `dlopen`s;
+# `rlib` retains the in-crate `#[cfg(test)]` harness + lets the workspace use it
+# as a normal Rust lib.
+crate-type = ["cdylib", "rlib"]
+
+# raccoon is a **backend-only** plugin: no `raccoon.` tool surface, just one
+# `diagnostics` domain backend (see `src/abi_export.rs`). It inspects the local
+# gaming box (this plugin runs on the machine it diagnoses) and emits typed
+# findings + repairs through orca's diagnostics contract. The orca surface
+# (serde_json, the contract::diagnostics types, abi::BackendDef) is reached
+# through `plugin_toolkit::*`.
+[dependencies]
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+
+# The ONE genuine non-orca dep for the FFI boundary: `#[export_root_module]`
+# expands to bare `::abi_stable` paths in this crate's root, so it can't route
+# through the toolkit. Pinned to the orca workspace version (0.11) so the layout
+# hash baked into the cdylib matches what orca's plugin-loader checks at load.
+abi_stable = "0.11"
+
+# The plugin's hand-written source derives/parses with fully-qualified `serde` /
+# `serde_json` paths (config-row parsing, Finding (de)serialization). Pinned to
+# the orca workspace major so cargo unifies them with the toolkit's copy into a
+# single crate instance — the contract::diagnostics types cross the seam as one.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+
+# Match orca's workspace lint floor: discarding a Result/Option via
+# `let _ = ...` stays a hard error so the plugin remains portable back into the
+# orca workspace.
+[lints.clippy]
+let_underscore_must_use = "deny"
