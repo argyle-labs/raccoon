@@ -11,6 +11,35 @@ restore an existing one) to the same known-good state.
 **Tested distros:** [Bazzite](https://bazzite.gg) (Fedora atomic) and
 [CachyOS](https://cachyos.org) (Arch). Structured so other distros slot in.
 
+## As an orca diagnostics plugin
+
+raccoon is also an **orca plugin** (a Rust `cdylib`) that registers a provider in
+orca's `diagnostics` capability domain. Running on the gaming box, it emits typed
+`Finding`s (with optional repairs) that surface uniformly on orca's MCP / CLI /
+REST — no bespoke scripts required:
+
+```bash
+orca diagnostics diagnose                                   # typed findings across all providers
+orca diagnostics repair --provider raccoon --repair-id cpu-mode
+```
+
+Checks (each a typed `Finding` + optional `Repair`): **alsa-headroom** (audio
+crackle/dropout), **cpu-mode** (vs the `power:cpu` orca setting → tuned profile),
+**scx** (sched_ext/scx_lavd), **gpu-perf** (AMD DPM level), **shader-cache**
+(Steam pre-caching), **vrr** (adaptive-sync). This is the typed port of the
+`doctor.sh` logic below; the shell scripts remain for standalone / no-orca use.
+
+Build the plugin (`cdylib` for the target box, loaded by orca's plugin-loader):
+
+```bash
+cargo build --release                                       # host
+cargo zigbuild --release --target x86_64-unknown-linux-gnu  # cross-compile for a Linux box
+# install the resulting lib{raccoon}.so via orca's plugin install path
+```
+
+The plugin needs an orca daemon that provides the `diagnostics` domain
+(≥ the release that adds it). See `docs/SETUP.md` for the per-check detail.
+
 ## The pathway
 
 | Layer | Tool | Notes |
