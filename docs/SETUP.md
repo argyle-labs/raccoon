@@ -116,6 +116,55 @@ shows via Quick Access (**Ctrl+2**) → Performance → Overlay level.
 
 ---
 
+## 5b. Audio — stop crackle / dropouts (ALSA headroom)
+Symptom: audio crackles or briefly cuts out during gameplay, worst on the GPU
+HDMI output. Cause: PipeWire defaults ALSA sinks to `api.alsa.headroom = 0`, so
+with a small negotiated quantum there is no slack — any late audio-thread wakeup
+(GPU under load, powersave CPU governor) underruns and you hear a click/gap.
+
+Fix is the WirePlumber drop-in `configs/wireplumber/51-alsa-headroom.conf`,
+which sets `api.alsa.headroom = 2048` (~43ms buffered ahead) on every ALSA sink.
+`bootstrap.sh` installs it to
+`~/.config/wireplumber/wireplumber.conf.d/51-alsa-headroom.conf` and restarts
+wireplumber. It is a user config file, so it **survives reboots** and reapplies
+on every login. Verify it's live:
+
+```
+pw-dump | grep -c '"api.alsa.headroom": 2048'     # one per ALSA sink
+timeout 6 pw-top -b -n 5 | grep hdmi              # ERR column should stay 0
+```
+
+`doctor.sh` checks both that the file matches the repo **and** that the running
+graph actually shows headroom applied (catches "installed but wireplumber not
+restarted"); `--repair` reinstalls and reloads.
+
+### CPU power mode (performance / balanced / powersave)
+A downclocking CPU is a secondary cause of crackle/stutter (late audio/frame
+wakeups under load). The desired mode is a **runtime orca setting** the machine
+owns — `power:cpu {mode}` — just like `display:target`. raccoon maps the mode to
+a real `tuned` profile (tuned owns the governor + EPP here — bragi is
+amd-pstate-epp — and persists the active profile across reboots, all cores):
+
+| mode | tuned profile | effect |
+|------|---------------|--------|
+| `performance` | `throughput-performance-bazzite` | max clocks — best for latency/audio/gaming |
+| `balanced`    | `balanced-bazzite`               | dynamic, slight perf bias |
+| `powersave`   | `powersave-bazzite`              | dynamic, biased to save power |
+
+```bash
+./scripts/cpu-mode.sh                 # show desired (orca) vs live (tuned)
+./scripts/cpu-mode.sh performance     # set orca value + apply (tuned-adm needs sudo)
+./scripts/cpu-mode.sh --apply         # apply whatever orca already says (doctor --repair uses this)
+# or set the value directly (no sudo; applies on next --apply / reboot enforcement):
+orca config set power cpu '{"mode":"performance"}'
+```
+
+`doctor.sh` reads the orca mode, compares it to the live tuned profile, and warns
+on drift with `sudo ./scripts/cpu-mode.sh --apply` as the (privileged) fix. If no
+mode is set for the host it stays quiet.
+
+---
+
 ## 6. Controller wake-from-sleep
 `./scripts/setup-controller-wake.sh` (needs sudo) installs
 `configs/udev/90-usb-wakeup.rules` and arms USB wake. **USB/dongle/wired only —
@@ -133,6 +182,44 @@ Some games need a tweak. Keep them here as you find them.
 
 ---
 
+## 8. Diagnose & repair (drift check)
+Over time a config can drift — Gaming Mode resets the refresh env, a game
+rewrites a file you'd locked, GE-Proton goes missing. `doctor.sh` checks the
+live machine against this repo's known-good state and reports each gap:
+
+```bash
+./doctor.sh              # report (read-only)
+./doctor.sh --repair     # re-apply the safe fixes (no sudo, no Steam restart)
+./bootstrap.sh --timer   # run it daily via a systemd --user timer (journal)
+```
+
+Each issue names the exact repair command. Privileged fixes (e.g. controller
+wake, which needs `sudo`) are **printed, not auto-run** — you apply them. Extend
+the per-game lock list in `doctor.sh` (`check_locked_game_files`) as §7 grows.
+
+---
+
+## 9. Tune from in-game metrics
+When a game feels rough (stutter, low fps), let the frame data say why instead
+of guessing. MangoHud logs every frame; `tune.sh` reads the log and reports
+findings with concrete tweaks.
+
+```bash
+./tune.sh enable      # sets output_folder + live 1%/0.1% low in the overlay
+# In-game: Shift_R+F12 shows the overlay; Shift_L+F2 starts/stops a capture.
+# Toggle a capture ON during the rough patch, OFF after ~30-60s, then:
+./tune.sh analyze     # newest log; or `./tune.sh watch` for a live rolling read
+```
+
+It separates **stutter** (high p99 frametime / spikes — hitching) from **low
+average fps** (GPU- or CPU-bound) from **thermal throttling** from **VRAM
+exhaustion** (peak used vs the card's capacity, read from the driver), because
+the fix differs. See [docs/NOTES.md](NOTES.md) → "Diagnosing stutter" for what each
+finding means and the DBH example. `--json` emits the same findings in the
+Issue shape for orca.
+
+---
+
 ## Restore checklist (fresh machine)
 1. Base packages (§0) → Proton-GE (§1)
 2. `./bootstrap.sh` (applies configs)
@@ -141,3 +228,5 @@ Some games need a tweak. Keep them here as you find them.
 5. Gaming Mode display (§4) + restart Gaming Mode
 6. Controller wake (§6); MangoHud (§5)
 7. Re-apply per-game fixes (§7)
+8. `./doctor.sh` — confirm everything is green (§8)
+9. Tune per-game from metrics as needed (§9)

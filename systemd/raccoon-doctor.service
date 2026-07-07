@@ -1,0 +1,9 @@
+[Unit]
+Description=raccoon doctor - check gaming setup for config drift
+
+[Service]
+Type=oneshot
+# Read-only report to the journal (view: journalctl --user -u raccoon-doctor).
+# Does NOT auto-repair; run `./doctor.sh --repair` by hand to apply fixes.
+ExecStart=@HERE@/doctor.sh
+Nice=15
