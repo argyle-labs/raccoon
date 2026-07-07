@@ -87,7 +87,10 @@ fn check_alsa_headroom() -> Option<Finding> {
             "alsa-headroom",
             Severity::Warn,
             "Audio has no ALSA headroom (crackle/dropout risk)",
-            format!("WirePlumber drop-in missing at {}; ALSA sinks run headroom=0 and underrun under load", dst.display()),
+            format!(
+                "WirePlumber drop-in missing at {}; ALSA sinks run headroom=0 and underrun under load",
+                dst.display()
+            ),
             repair,
         ));
     }
@@ -120,7 +123,8 @@ fn check_alsa_headroom() -> Option<Finding> {
             "alsa-headroom",
             Severity::Warn,
             "ALSA headroom config present but not applied",
-            "a sink still reports headroom=0; wireplumber needs a restart to pick it up".to_string(),
+            "a sink still reports headroom=0; wireplumber needs a restart to pick it up"
+                .to_string(),
             repair,
         ));
     }
@@ -203,7 +207,8 @@ fn check_scx() -> Option<Finding> {
             "scx",
             Severity::Warn,
             "sched_ext available but off (scx_lavd)",
-            "a game-tuned scheduler is installed but disabled; scx_lavd smooths 1% lows under load".to_string(),
+            "a game-tuned scheduler is installed but disabled; scx_lavd smooths 1% lows under load"
+                .to_string(),
             Some(repair_spec(
                 "scx",
                 "Enable scx_loader (systemctl, privileged)",
@@ -231,7 +236,10 @@ fn check_gpu_perf() -> Option<Finding> {
             "gpu-perf",
             Severity::Warn,
             "GPU performance level capped",
-            format!("DPM '{lvl}' at {} — not auto/high; clocks may be capped below what games need", path.display()),
+            format!(
+                "DPM '{lvl}' at {} — not auto/high; clocks may be capped below what games need",
+                path.display()
+            ),
             Some(repair_spec(
                 "gpu-perf",
                 "Restore DPM to auto (sysfs write, privileged)",
@@ -294,7 +302,9 @@ fn check_vrr() -> Option<Finding> {
             "vrr",
             Severity::Info,
             "Display is VRR-capable",
-            format!("{name}: enable Adaptive Sync/VRR (Gaming Mode Display, or KDE Settings → Display) to kill tearing/stutter"),
+            format!(
+                "{name}: enable Adaptive Sync/VRR (Gaming Mode Display, or KDE Settings → Display) to kill tearing/stutter"
+            ),
             None,
         ));
     }
@@ -340,14 +350,20 @@ fn repair_alsa_headroom() -> (bool, String) {
         ),
         Err(e) => (
             false,
-            format!("wrote {} but wireplumber restart failed: {e}", dst.display()),
+            format!(
+                "wrote {} but wireplumber restart failed: {e}",
+                dst.display()
+            ),
         ),
     }
 }
 
 fn repair_cpu_mode() -> (bool, String) {
     let Some(mode) = orca_power_cpu_mode() else {
-        return (false, "no orca power:cpu mode set for this host".to_string());
+        return (
+            false,
+            "no orca power:cpu mode set for this host".to_string(),
+        );
     };
     let Some(want) = tuned_profile_for(&mode) else {
         return (false, format!("unknown mode '{mode}'"));
@@ -356,7 +372,9 @@ fn repair_cpu_mode() -> (bool, String) {
         Ok(_) => (true, format!("applied '{mode}' → tuned profile '{want}'")),
         Err(e) => (
             false,
-            format!("tuned-adm profile {want} failed ({e}); run with privilege: sudo tuned-adm profile {want}"),
+            format!(
+                "tuned-adm profile {want} failed ({e}); run with privilege: sudo tuned-adm profile {want}"
+            ),
         ),
     }
 }
@@ -366,7 +384,9 @@ fn repair_scx() -> (bool, String) {
         Ok(_) => (true, "enabled scx_loader (select lavd)".to_string()),
         Err(e) => (
             false,
-            format!("enabling scx_loader failed ({e}); run with privilege: sudo systemctl enable --now scx_loader"),
+            format!(
+                "enabling scx_loader failed ({e}); run with privilege: sudo systemctl enable --now scx_loader"
+            ),
         ),
     }
 }
@@ -389,7 +409,10 @@ fn repair_gpu_perf() -> (bool, String) {
     } else {
         (
             false,
-            format!("DPM write failed ({last_err}); needs privilege: echo auto | sudo tee {}", paths[0].display()),
+            format!(
+                "DPM write failed ({last_err}); needs privilege: echo auto | sudo tee {}",
+                paths[0].display()
+            ),
         )
     }
 }
@@ -412,9 +435,16 @@ fn tuned_profile_for(mode: &str) -> Option<String> {
     };
     let bazzite = format!("{base}-bazzite");
     let has_bazzite = run_ok("tuned-adm", &["list"])
-        .map(|out| out.lines().any(|l| l.trim_start_matches("- ").starts_with(&bazzite)))
+        .map(|out| {
+            out.lines()
+                .any(|l| l.trim_start_matches("- ").starts_with(&bazzite))
+        })
         .unwrap_or(false);
-    Some(if has_bazzite { bazzite } else { base.to_string() })
+    Some(if has_bazzite {
+        bazzite
+    } else {
+        base.to_string()
+    })
 }
 
 fn tuned_active() -> Option<String> {
