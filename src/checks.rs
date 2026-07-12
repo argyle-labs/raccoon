@@ -67,6 +67,8 @@ fn repair_spec(id: &str, description: &str, automatic: bool, privileged: bool) -
         description: description.to_string(),
         automatic,
         privileged,
+        // raccoon repairs everything in-place; no managed-unit delegation.
+        delegate: None,
     }
 }
 
