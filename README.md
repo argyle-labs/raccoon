@@ -13,7 +13,7 @@ restore an existing one) to the same known-good state.
 
 ## As an orca diagnostics plugin
 
-raccoon is also an **orca plugin** (a Rust `cdylib`) that registers a provider in
+raccoon is also an **orca plugin** (a Rust subprocess plugin) that registers a provider in
 orca's `diagnostics` capability domain. Running on the gaming box, it emits typed
 `Finding`s (with optional repairs) that surface uniformly on orca's MCP / CLI /
 REST — no bespoke scripts required:
@@ -29,7 +29,7 @@ crackle/dropout), **cpu-mode** (vs the `power:cpu` orca setting → tuned profil
 (Steam pre-caching), **vrr** (adaptive-sync). This is the typed port of the
 `doctor.sh` logic below; the shell scripts remain for standalone / no-orca use.
 
-Build the plugin (`cdylib` for the target box, loaded by orca's plugin-loader):
+Build the plugin (a `[[bin]]` for the target box, spawned by orca's plugin loader):
 
 ```bash
 cargo build --release                                       # host
