@@ -4,12 +4,18 @@
 
 # raccoon
 
-Opinionated, reproducible setup for a Linux gaming machine — every launcher and
-the system tweaks that make them work, in one place. Bring up a fresh box (or
-restore an existing one) to the same known-good state.
+Opinionated, reproducible setup for a Linux **desktop** — the dev/desktop base,
+practical KDE apps, and the gaming stack with the system tweaks that make it all
+work, in one place. Bring up a fresh box (or restore an existing one) to the same
+known-good state.
 
 **Tested distros:** [Bazzite](https://bazzite.gg) (Fedora atomic) and
 [CachyOS](https://cachyos.org) (Arch). Structured so other distros slot in.
+
+```bash
+./bootstrap.sh              # desktop/dev base + gaming + configs
+./scripts/setup-kde.sh      # practical KDE apps + fonts (Arch)
+```
 
 ## As an orca diagnostics plugin
 
@@ -23,11 +29,21 @@ orca diagnostics diagnose                                   # typed findings acr
 orca diagnostics repair --provider raccoon --repair-id cpu-mode
 ```
 
-Checks (each a typed `Finding` + optional `Repair`): **alsa-headroom** (audio
-crackle/dropout), **cpu-mode** (vs the `power:cpu` orca setting → tuned profile),
-**scx** (sched_ext/scx_lavd), **gpu-perf** (AMD DPM level), **shader-cache**
-(Steam pre-caching), **vrr** (adaptive-sync). This is the typed port of the
-`doctor.sh` logic below; the shell scripts remain for standalone / no-orca use.
+Checks (each a typed `Finding` + optional `Repair`):
+
+- **System/gaming drift:** **alsa-headroom** (audio crackle/dropout), **cpu-mode**
+  (vs the `power:cpu` orca setting → tuned profile), **scx** (sched_ext/scx_lavd),
+  **gpu-perf** (AMD DPM level), **shader-cache** (Steam pre-caching), **vrr**
+  (adaptive-sync).
+- **Provisioning** (setup over orca — the repair installs what's missing):
+  **dev-toolchain**, **kde-apps**, **gaming-stack**. These are the orca-native
+  form of the three `scripts/setup-*.sh`, so a box can be brought up with
+  `orca diagnostics repair --provider raccoon --repair-id dev-toolchain` (etc.)
+  and stays drift-checked afterward. Package installs are privileged and
+  non-automatic (printed if `sudo` isn't cached).
+
+This is the typed port of the `doctor.sh` logic below; the shell scripts remain
+for standalone / no-orca / fresh-box use.
 
 Build the plugin (a `[[bin]]` for the target box, spawned by orca's plugin loader):
 
@@ -60,12 +76,15 @@ Both feed the Steam library, so everything ends up as tiles in Gaming Mode.
 ```bash
 git clone https://github.com/argyle-labs/raccoon.git
 cd raccoon
-./bootstrap.sh            # detects distro, installs launchers, applies configs
+./bootstrap.sh            # desktop/dev base + gaming launchers + configs
+                         #   --no-base skips the dev base; --timer adds the doctor timer
 ```
 
 Then per-component (see [docs/SETUP.md](docs/SETUP.md) for the full runbook):
 
 ```bash
+./scripts/setup-desktop.sh           # dev/desktop base: packages, paru, 1Password, gcloud, node, fonts
+./scripts/setup-kde.sh               # practical KDE apps + fonts (Arch) — see docs/KDE.md
 ./scripts/install-blizzard.sh        # Battle.net (+ optional EA/Ubisoft) via NSL
 ./scripts/setup-controller-wake.sh   # wake from sleep via USB controller (needs sudo)
 ./scripts/setup-gamescope-refresh.sh # Gaming Mode: expose up to 120Hz to all games (Bazzite)
@@ -114,13 +133,16 @@ stutter is visible in the moment; `tune.sh` explains *why* and what to change.
 ## Repo layout
 
 ```
-bootstrap.sh                 # distro-detecting installer + config applier (--timer)
+bootstrap.sh                 # desktop base + gaming + configs (--no-base, --timer)
 doctor.sh                    # drift check + repair for the gaming setup
 tune.sh                      # review MangoHud metrics -> tuning suggestions
-scripts/                     # individual, re-runnable setup scripts
+scripts/setup-desktop.sh     # dev/desktop base packages (paru, 1Password, gcloud, node, fonts)
+scripts/setup-kde.sh         # practical KDE apps + fonts (Arch)
+scripts/                     # individual, re-runnable setup scripts (gaming + system)
 configs/                     # drop-in config files (env.d, MangoHud, udev, wireplumber)
 systemd/                     # optional daily doctor timer (user)
 docs/SETUP.md                # full setup + restore runbook (Bazzite + CachyOS)
+docs/KDE.md                  # KDE apps reference
 docs/NOTES.md                # field notes / gotchas (Battle.net, umu, gamescope)
 ```
 

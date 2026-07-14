@@ -37,6 +37,9 @@ pub fn diagnose(_args_json: &str) -> Result<String, String> {
         check_gpu_perf(),
         check_shader_cache(),
         check_vrr(),
+        check_dev_toolchain(),
+        check_kde_apps(),
+        check_gaming_stack(),
     ]
     .into_iter()
     .flatten()
@@ -313,6 +316,234 @@ fn check_vrr() -> Option<Finding> {
     None
 }
 
+// ── provisioning (dev / desktop / gaming) ───────────────────────────────────────
+// Presence checks for the three setup concerns; each repair installs the missing
+// packages via the host package manager (privileged, non-automatic). The
+// standalone scripts/setup-*.sh stay for no-orca / fresh-box use.
+
+/// Probe binaries per concern. node/gcloud/1Password have their own installers
+/// (scripts/setup-dev.sh), so they are intentionally not gated here.
+const DEV_BINS: &[&str] = &["zsh", "git", "direnv", "java", "alacritty", "fastfetch"];
+const KDE_BINS: &[&str] = &["yakuake", "kate", "okular", "gwenview"];
+const GAMING_BINS: &[&str] = &["steam", "mangohud", "gamescope"];
+
+/// Install package sets (fuller than the probe bins), per distro family.
+const DEV_PKGS_ARCH: &[&str] = &[
+    "zsh",
+    "git",
+    "curl",
+    "direnv",
+    "jdk17-openjdk",
+    "postgresql-libs",
+    "alacritty",
+    "fastfetch",
+    "eza",
+    "bat",
+];
+const DEV_PKGS_APT: &[&str] = &[
+    "zsh",
+    "git",
+    "curl",
+    "direnv",
+    "openjdk-17-jdk",
+    "libpq-dev",
+    "alacritty",
+    "fastfetch",
+];
+const DEV_PKGS_DNF: &[&str] = &[
+    "zsh",
+    "git",
+    "curl",
+    "direnv",
+    "java-17-openjdk",
+    "libpq-devel",
+    "alacritty",
+    "fastfetch",
+];
+const KDE_PKGS: &[&str] = &[
+    "partitionmanager",
+    "ffmpegthumbs",
+    "kio-extras",
+    "xdg-desktop-portal-kde",
+    "yakuake",
+    "kate",
+    "ark",
+    "okular",
+    "gwenview",
+    "kdeconnect",
+    "kdegraphics-thumbnailers",
+    "noto-fonts",
+    "noto-fonts-emoji",
+    "ttf-jetbrains-mono",
+    "papirus-icon-theme",
+];
+const GAMING_PKGS_ARCH: &[&str] = &["steam", "lutris", "mangohud", "gamescope", "umu-launcher"];
+
+/// Host package manager (paru→pacman preferred, then apt/dnf); None off-Linux.
+fn pkg_mgr() -> Option<&'static str> {
+    ["paru", "pacman", "apt-get", "dnf"]
+        .into_iter()
+        .find(|pm| which(pm).is_some())
+}
+
+fn missing(bins: &[&str]) -> Vec<String> {
+    bins.iter()
+        .filter(|b| which(b).is_none())
+        .map(|b| b.to_string())
+        .collect()
+}
+
+fn check_dev_toolchain() -> Option<Finding> {
+    pkg_mgr()?; // no supported package manager (e.g. macOS build host) — skip
+    let miss = missing(DEV_BINS);
+    if miss.is_empty() {
+        return Some(finding(
+            "dev-toolchain",
+            Severity::Ok,
+            "Dev toolchain present",
+            "zsh, git, direnv, jdk, alacritty, fastfetch installed".to_string(),
+            None,
+        ));
+    }
+    Some(finding(
+        "dev-toolchain",
+        Severity::Warn,
+        "Dev toolchain incomplete",
+        format!(
+            "missing: {} (node/gcloud/1Password: scripts/setup-dev.sh)",
+            miss.join(", ")
+        ),
+        Some(repair_spec(
+            "dev-toolchain",
+            "Install the dev toolchain via the host package manager (privileged)",
+            false,
+            true,
+        )),
+    ))
+}
+
+fn check_kde_apps() -> Option<Finding> {
+    which("pacman")?; // KDE app set is curated for Arch/CachyOS
+    let miss = missing(KDE_BINS);
+    if miss.is_empty() {
+        return Some(finding(
+            "kde-apps",
+            Severity::Ok,
+            "KDE apps present",
+            "yakuake, kate, okular, gwenview installed".to_string(),
+            None,
+        ));
+    }
+    Some(finding(
+        "kde-apps",
+        Severity::Info,
+        "KDE apps not installed",
+        format!("missing: {} (see docs/KDE.md)", miss.join(", ")),
+        Some(repair_spec(
+            "kde-apps",
+            "Install the practical KDE app set via pacman (privileged)",
+            false,
+            true,
+        )),
+    ))
+}
+
+fn check_gaming_stack() -> Option<Finding> {
+    pkg_mgr()?;
+    let miss = missing(GAMING_BINS);
+    if miss.is_empty() {
+        return Some(finding(
+            "gaming-stack",
+            Severity::Ok,
+            "Gaming stack present",
+            "steam, mangohud, gamescope installed".to_string(),
+            None,
+        ));
+    }
+    Some(finding(
+        "gaming-stack",
+        Severity::Warn,
+        "Gaming stack incomplete",
+        format!("missing: {}", miss.join(", ")),
+        Some(repair_spec(
+            "gaming-stack",
+            "Install launchers + MangoHud/gamescope (pacman on Arch, Flatpak elsewhere)",
+            false,
+            true,
+        )),
+    ))
+}
+
+/// Privileged package install, non-interactive. paru→pacman (never run paru as
+/// root). On failure, return the exact command to run by hand — plugins can't
+/// prompt for a sudo password.
+fn pm_install(pkgs: &[&str]) -> (bool, String) {
+    let (bin, verb): (&str, &[&str]) = match pkg_mgr() {
+        Some("paru") | Some("pacman") => ("pacman", &["-S", "--needed", "--noconfirm"]),
+        Some("apt-get") => ("apt-get", &["install", "-y"]),
+        Some("dnf") => ("dnf", &["install", "-y"]),
+        _ => return (false, "no supported package manager".to_string()),
+    };
+    let mut args: Vec<&str> = vec!["-n", bin];
+    args.extend_from_slice(verb);
+    args.extend_from_slice(pkgs);
+    let display = format!("sudo {} {} {}", bin, verb.join(" "), pkgs.join(" "));
+    match run("sudo", &args) {
+        Ok(_) => (true, format!("installed: {}", pkgs.join(", "))),
+        Err(e) => (false, format!("install failed ({e}); run: {display}")),
+    }
+}
+
+fn repair_dev_toolchain() -> (bool, String) {
+    let pkgs = match pkg_mgr() {
+        Some("paru") | Some("pacman") => DEV_PKGS_ARCH,
+        Some("apt-get") => DEV_PKGS_APT,
+        Some("dnf") => DEV_PKGS_DNF,
+        _ => return (false, "no supported package manager".to_string()),
+    };
+    let (ok, msg) = pm_install(pkgs);
+    (
+        ok,
+        format!("{msg}. node/gcloud/1Password: scripts/setup-dev.sh"),
+    )
+}
+
+fn repair_kde_apps() -> (bool, String) {
+    if which("pacman").is_none() {
+        return (false, "KDE app set is Arch-only (pacman)".to_string());
+    }
+    pm_install(KDE_PKGS)
+}
+
+fn repair_gaming_stack() -> (bool, String) {
+    if which("pacman").is_some() {
+        return pm_install(GAMING_PKGS_ARCH);
+    }
+    // Non-Arch (e.g. Bazzite): Steam/mangohud/gamescope are preinstalled; add the
+    // Flatpak launchers (no privilege needed).
+    match run(
+        "flatpak",
+        &[
+            "install",
+            "-y",
+            "--noninteractive",
+            "flathub",
+            "com.heroicgameslauncher.hgl",
+            "net.lutris.Lutris",
+            "com.vysp3r.ProtonPlus",
+        ],
+    ) {
+        Ok(_) => (
+            true,
+            "installed Flatpak launchers (Heroic, Lutris, ProtonPlus)".to_string(),
+        ),
+        Err(e) => (
+            false,
+            format!("flatpak install failed ({e}); run scripts/setup-gaming.sh"),
+        ),
+    }
+}
+
 // ── repair ─────────────────────────────────────────────────────────────────────
 
 /// Run one repair by id and return a [`RepairOutcome`] as JSON.
@@ -324,6 +555,9 @@ pub fn repair(args_json: &str) -> Result<String, String> {
         "cpu-mode" => repair_cpu_mode(),
         "scx" => repair_scx(),
         "gpu-perf" => repair_gpu_perf(),
+        "dev-toolchain" => repair_dev_toolchain(),
+        "kde-apps" => repair_kde_apps(),
+        "gaming-stack" => repair_gaming_stack(),
         other => (false, format!("raccoon has no repair '{other}'")),
     };
     let outcome = RepairOutcome {
