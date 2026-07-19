@@ -19,6 +19,10 @@ use serde::Deserialize;
 const HEADROOM_CONF: &str = include_str!("../configs/wireplumber/51-alsa-headroom.conf");
 const HEADROOM_REL: &str = ".config/wireplumber/wireplumber.conf.d/51-alsa-headroom.conf";
 
+/// Persistent udev rule that pins the flagged radios' USB wakeup off across
+/// reboots and immutable-OS updates. Written by the `suspend-wakeup` repair.
+const WAKEUP_RULE_PATH: &str = "/etc/udev/rules.d/90-disable-usb-wakeup.rules";
+
 // ── diagnose ─────────────────────────────────────────────────────────────────
 
 /// Run every check and return the findings as JSON (`Vec<Finding>`). The
@@ -34,6 +38,7 @@ pub fn diagnose(_args_json: &str) -> Result<String, String> {
         check_alsa_headroom(),
         check_cpu_mode(),
         check_scx(),
+        check_suspend_wakeup(),
         check_gpu_perf(),
         check_shader_cache(),
         check_vrr(),
@@ -217,6 +222,60 @@ fn check_scx() -> Option<Finding> {
             Some(repair_spec(
                 "scx",
                 "Enable scx_loader (systemctl, privileged)",
+                false,
+                true,
+            )),
+        ))
+    }
+}
+
+/// Suspend that won't hold / high idle draw: wireless radios (USB receivers, BT
+/// dongles) left with `power/wakeup=enabled` generate wake events that abort
+/// s2idle/deep suspend — the box only reaches display-off and keeps drawing full
+/// power. Flag every non-hub USB device that can still wake the machine, and
+/// note if `mem_sleep` isn't the low-power `deep` state. (Seen on bragi: a
+/// Logitech Unifying receiver + BT radio bounced suspend at ~15s every cycle.)
+fn check_suspend_wakeup() -> Option<Finding> {
+    let culprits = wakeup_culprits();
+    if culprits.is_empty() {
+        // Only report OK when the sysfs tree actually exists (Linux w/ USB).
+        Path::new("/sys/bus/usb/devices").exists().then(|| {
+            finding(
+                "suspend-wakeup",
+                Severity::Ok,
+                "No stray USB wake sources",
+                "no non-hub USB device can wake the machine; suspend can hold".to_string(),
+                None,
+            )
+        })
+    } else {
+        let list = culprits
+            .iter()
+            .map(|c| format!("{} ({})", c.label, c.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let deep = read_trim("/sys/power/mem_sleep")
+            .map(|s| s.contains("[deep]"))
+            .unwrap_or(true);
+        let sleep_note = if deep {
+            String::new()
+        } else {
+            " (also: /sys/power/mem_sleep is not [deep] — S3 gives the lowest idle draw)"
+                .to_string()
+        };
+        Some(finding(
+            "suspend-wakeup",
+            Severity::Warn,
+            "USB wake sources can abort suspend (high idle power)",
+            format!(
+                "{} wake-enabled: idle wake events abort s2idle/deep suspend so the box only \
+                 reaches display-off and keeps drawing power{sleep_note}",
+                list
+            ),
+            Some(repair_spec(
+                "suspend-wakeup",
+                "Disable USB wakeup on the flagged radios (live sysfs + persistent udev rule, privileged). \
+                 Note: this also disables wake-on-controller for wireless pads on the list.",
                 false,
                 true,
             )),
@@ -554,6 +613,7 @@ pub fn repair(args_json: &str) -> Result<String, String> {
         "alsa-headroom" => repair_alsa_headroom(),
         "cpu-mode" => repair_cpu_mode(),
         "scx" => repair_scx(),
+        "suspend-wakeup" => repair_suspend_wakeup(),
         "gpu-perf" => repair_gpu_perf(),
         "dev-toolchain" => repair_dev_toolchain(),
         "kde-apps" => repair_kde_apps(),
@@ -653,7 +713,113 @@ fn repair_gpu_perf() -> (bool, String) {
     }
 }
 
+/// Disable USB wakeup on every flagged radio: write `disabled` to each device's
+/// `power/wakeup` (live, no replug) and persist a udev rule so it survives
+/// reboots + immutable-OS updates. Both writes need root; on failure we hand
+/// back the exact commands, since plugins can't prompt for a sudo password.
+fn repair_suspend_wakeup() -> (bool, String) {
+    let culprits = wakeup_culprits();
+    if culprits.is_empty() {
+        return (true, "no wake-enabled USB radios to disable".to_string());
+    }
+    // Live writes.
+    let mut disabled = 0;
+    for c in &culprits {
+        if fs::write(&c.wakeup_path, "disabled").is_ok() {
+            disabled += 1;
+        }
+    }
+    // Persistent udev rule (one match line per vendor:product).
+    let rule: String = culprits
+        .iter()
+        .filter_map(|c| c.id.split_once(':'))
+        .map(|(v, p)| {
+            format!(
+                "ACTION==\"add\", SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"{v}\", \
+                 ATTR{{idProduct}}==\"{p}\", ATTR{{power/wakeup}}=\"disabled\"\n"
+            )
+        })
+        .collect();
+    let rule_ok = fs::write(WAKEUP_RULE_PATH, &rule).is_ok();
+
+    if disabled == culprits.len() && rule_ok {
+        return (
+            true,
+            format!(
+                "disabled USB wakeup on {disabled} device(s) and wrote {WAKEUP_RULE_PATH}; \
+                 suspend can now hold (verify: sync; sudo rtcwake -m no -s 30; sudo systemctl suspend)"
+            ),
+        );
+    }
+    // Partial/failed — emit the by-hand commands.
+    let live_cmds = culprits
+        .iter()
+        .map(|c| format!("echo disabled | sudo tee {}", c.wakeup_path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (
+        false,
+        format!(
+            "needs privilege (disabled {disabled}/{}, rule {}). Run:\n{live_cmds}\nsudo tee {WAKEUP_RULE_PATH} <<'EOF'\n{rule}EOF",
+            culprits.len(),
+            if rule_ok { "written" } else { "unwritten" }
+        ),
+    )
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────────
+
+/// A USB device that can currently wake the machine.
+struct WakeCulprit {
+    /// `idVendor:idProduct`, e.g. `046d:c52b`.
+    id: String,
+    /// Human label — product/manufacturer string, or the bus path if unnamed.
+    label: String,
+    /// Absolute path to the device's `power/wakeup` attribute.
+    wakeup_path: PathBuf,
+}
+
+/// Enumerate `/sys/bus/usb/devices/*` for devices with `power/wakeup=enabled`
+/// that are neither root hubs (`usbN`) nor hubs (`bDeviceClass==09`). Those are
+/// the receivers/radios/controllers that actually abort suspend; hubs only relay
+/// downstream wake events and must stay enabled.
+fn wakeup_culprits() -> Vec<WakeCulprit> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir("/sys/bus/usb/devices") else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let dev = e.path();
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("usb") {
+            continue; // root hub
+        }
+        let wakeup_path = dev.join("power/wakeup");
+        if read_trim(&wakeup_path.to_string_lossy()).as_deref() != Some("enabled") {
+            continue;
+        }
+        // Skip hubs (class 09) — they pass wake through from downstream ports.
+        if read_trim(&dev.join("bDeviceClass").to_string_lossy()).as_deref() == Some("09") {
+            continue;
+        }
+        let vendor = read_trim(&dev.join("idVendor").to_string_lossy()).unwrap_or_default();
+        let product = read_trim(&dev.join("idProduct").to_string_lossy()).unwrap_or_default();
+        if vendor.is_empty() || product.is_empty() {
+            continue;
+        }
+        let label = read_trim(&dev.join("product").to_string_lossy())
+            .or_else(|| read_trim(&dev.join("manufacturer").to_string_lossy()))
+            .unwrap_or_else(|| name.into_owned());
+        out.push(WakeCulprit {
+            id: format!("{vendor}:{product}"),
+            label,
+            wakeup_path,
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
 
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -806,6 +972,29 @@ mod tests {
         let findings: Vec<Finding> = serde_json::from_str(&out).expect("valid findings json");
         for f in &findings {
             assert_eq!(f.provider, crate::PROVIDER);
+        }
+    }
+
+    #[test]
+    fn wakeup_culprits_never_flag_hubs_or_roothubs() {
+        // On any host the enumerated culprits must exclude root hubs and hubs.
+        for c in wakeup_culprits() {
+            assert!(
+                !c.id.is_empty() && c.id.contains(':'),
+                "id is vendor:product"
+            );
+            assert!(c.wakeup_path.ends_with("power/wakeup"));
+        }
+    }
+
+    #[test]
+    fn repair_suspend_wakeup_is_idempotent_when_clean() {
+        // With no wake-enabled radios present (typical CI host), the repair is a
+        // no-op success rather than an error.
+        if wakeup_culprits().is_empty() {
+            let (ok, msg) = repair_suspend_wakeup();
+            assert!(ok);
+            assert!(msg.contains("no wake-enabled"));
         }
     }
 
