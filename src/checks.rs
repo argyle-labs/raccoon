@@ -22,6 +22,16 @@ const HEADROOM_REL: &str = ".config/wireplumber/wireplumber.conf.d/51-alsa-headr
 /// Persistent udev rule that pins the flagged radios' USB wakeup off across
 /// reboots and immutable-OS updates. Written by the `suspend-wakeup` repair.
 const WAKEUP_RULE_PATH: &str = "/etc/udev/rules.d/90-disable-usb-wakeup.rules";
+/// Persistent udev rule that disables PME wake on every xHCI host controller +
+/// USB root hub (`idVendor==1d6b`). The controllers — not the leaf devices — are
+/// the layer where AMD platforms route USB wake (`pinctrl_amd`), so this is what
+/// actually stops an immediate bounce out of S3. Written by the repair.
+const CONTROLLER_RULE_PATH: &str = "/etc/udev/rules.d/91-disable-usb-controller-wakeup.rules";
+const CONTROLLER_RULE_BODY: &str = "\
+# Power-button-only wake: disable PME wake on all xHCI controllers + USB root hubs
+ACTION==\"add\", SUBSYSTEM==\"pci\", ATTR{class}==\"0x0c0330\", ATTR{power/wakeup}=\"disabled\"
+ACTION==\"add\", SUBSYSTEM==\"usb\", ATTR{idVendor}==\"1d6b\", ATTR{power/wakeup}=\"disabled\"
+";
 
 // ── diagnose ─────────────────────────────────────────────────────────────────
 
@@ -229,58 +239,106 @@ fn check_scx() -> Option<Finding> {
     }
 }
 
-/// Suspend that won't hold / high idle draw: wireless radios (USB receivers, BT
-/// dongles) left with `power/wakeup=enabled` generate wake events that abort
-/// s2idle/deep suspend — the box only reaches display-off and keeps drawing full
-/// power. Flag every non-hub USB device that can still wake the machine, and
-/// note if `mem_sleep` isn't the low-power `deep` state. (Seen on bragi: a
-/// Logitech Unifying receiver + BT radio bounced suspend at ~15s every cycle.)
+/// Suspend that won't hold / high idle draw. Several independent layers can arm
+/// a wake source that aborts s2idle/deep suspend — the box only reaches
+/// display-off and keeps drawing full power. This surveys all of them:
+/// (1) USB **host controllers / root hubs** left wake-armed — on AMD the layer
+/// where wake actually routes (`pinctrl_amd`), the real bouncer; (2) wireless
+/// USB **radios** (receivers, BT dongles) still wake-armed; (3) Ethernet
+/// **Wake-on-LAN** — a stray LAN packet PMEs the NIC awake; (4) a blanket
+/// **udev rule** that re-arms `power/wakeup=enabled` on every boot (the root
+/// cause that silently undoes any per-device fix). All four were live on bragi;
+/// the box bounced out of S3 at ~14s until every layer was disabled.
 fn check_suspend_wakeup() -> Option<Finding> {
-    let culprits = wakeup_culprits();
-    if culprits.is_empty() {
-        // Only report OK when the sysfs tree actually exists (Linux w/ USB).
-        Path::new("/sys/bus/usb/devices").exists().then(|| {
-            finding(
-                "suspend-wakeup",
-                Severity::Ok,
-                "No stray USB wake sources",
-                "no non-hub USB device can wake the machine; suspend can hold".to_string(),
-                None,
-            )
-        })
-    } else {
-        let list = culprits
-            .iter()
-            .map(|c| format!("{} ({})", c.label, c.id))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let deep = read_trim("/sys/power/mem_sleep")
-            .map(|s| s.contains("[deep]"))
-            .unwrap_or(true);
-        let sleep_note = if deep {
-            String::new()
-        } else {
-            " (also: /sys/power/mem_sleep is not [deep] — S3 gives the lowest idle draw)"
-                .to_string()
-        };
-        Some(finding(
-            "suspend-wakeup",
-            Severity::Warn,
-            "USB wake sources can abort suspend (high idle power)",
-            format!(
-                "{} wake-enabled: idle wake events abort s2idle/deep suspend so the box only \
-                 reaches display-off and keeps drawing power{sleep_note}",
-                list
-            ),
-            Some(repair_spec(
-                "suspend-wakeup",
-                "Disable USB wakeup on the flagged radios (live sysfs + persistent udev rule, privileged). \
-                 Note: this also disables wake-on-controller for wireless pads on the list.",
-                false,
-                true,
-            )),
-        ))
+    // Only meaningful on a Linux host with the power-management sysfs tree.
+    if !Path::new("/sys/bus/usb/devices").exists() {
+        return None;
     }
+    let controllers = armed_usb_controllers();
+    let radios = wakeup_culprits();
+    let wol = wol_nics();
+    let blanket = blanket_wake_rules();
+
+    if controllers.is_empty() && radios.is_empty() && wol.is_empty() && blanket.is_empty() {
+        return Some(finding(
+            "suspend-wakeup",
+            Severity::Ok,
+            "No stray wake sources",
+            "USB controllers/radios quiesced, no Ethernet Wake-on-LAN, no blanket wake-arming \
+             udev rule; deep suspend can hold"
+                .to_string(),
+            None,
+        ));
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !controllers.is_empty() {
+        parts.push(format!(
+            "{} USB host controller(s)/root hub(s) wake-armed [{}] — the layer that bounces AMD S3",
+            controllers.len(),
+            controllers
+                .iter()
+                .map(|c| c.label.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !radios.is_empty() {
+        parts.push(format!(
+            "{} USB radio(s) wake-armed [{}]",
+            radios.len(),
+            radios
+                .iter()
+                .map(|c| format!("{} ({})", c.label, c.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !wol.is_empty() {
+        parts.push(format!(
+            "Ethernet Wake-on-LAN on [{}]",
+            wol.iter()
+                .map(|n| format!("{} (wol {})", n.iface, n.flags))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !blanket.is_empty() {
+        parts.push(format!(
+            "blanket wake-arming udev rule(s) that re-enable wakeup every boot [{}]",
+            blanket
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if read_trim("/sys/power/mem_sleep")
+        .map(|s| !s.contains("[deep]"))
+        .unwrap_or(false)
+    {
+        parts
+            .push("/sys/power/mem_sleep is not [deep] — S3 gives the lowest idle draw".to_string());
+    }
+
+    Some(finding(
+        "suspend-wakeup",
+        Severity::Warn,
+        "Wake sources can abort suspend (high idle power)",
+        format!(
+            "{}. Idle wake events abort deep suspend so the box only reaches display-off and \
+             keeps drawing power",
+            parts.join("; ")
+        ),
+        Some(repair_spec(
+            "suspend-wakeup",
+            "Quiesce all wake sources: disable USB controller/root-hub + radio wakeup (live sysfs \
+             + persistent udev rules), turn off Ethernet Wake-on-LAN, and neutralize any blanket \
+             wake-arming udev rule. Privileged; wake becomes power-button-only.",
+            false,
+            true,
+        )),
+    ))
 }
 
 /// AMD GPU DPM level: 'auto'/'high' let clocks scale; a stuck low/manual caps it.
@@ -713,58 +771,144 @@ fn repair_gpu_perf() -> (bool, String) {
     }
 }
 
-/// Disable USB wakeup on every flagged radio: write `disabled` to each device's
-/// `power/wakeup` (live, no replug) and persist a udev rule so it survives
-/// reboots + immutable-OS updates. Both writes need root; on failure we hand
-/// back the exact commands, since plugins can't prompt for a sudo password.
+/// Quiesce every wake layer the check flags: disable wakeup on USB controllers +
+/// root hubs + radios (live sysfs), persist udev rules so it survives reboots +
+/// immutable-OS updates, turn off Ethernet Wake-on-LAN, and neutralize any
+/// blanket wake-arming udev rule. All steps need root; each records success or
+/// falls back to the exact by-hand command, since plugins can't prompt for sudo.
 fn repair_suspend_wakeup() -> (bool, String) {
-    let culprits = wakeup_culprits();
-    if culprits.is_empty() {
-        return (true, "no wake-enabled USB radios to disable".to_string());
+    let controllers = armed_usb_controllers();
+    let radios = wakeup_culprits();
+    let wol = wol_nics();
+    let blanket = blanket_wake_rules();
+    if controllers.is_empty() && radios.is_empty() && wol.is_empty() && blanket.is_empty() {
+        return (true, "no wake sources to quiesce".to_string());
     }
-    // Live writes.
-    let mut disabled = 0;
-    for c in &culprits {
-        if fs::write(&c.wakeup_path, "disabled").is_ok() {
-            disabled += 1;
+
+    let mut done: Vec<String> = Vec::new();
+    let mut manual: Vec<String> = Vec::new();
+
+    // 1. Neutralize blanket wake-arming rules FIRST (they'd re-arm everything).
+    for p in &blanket {
+        let disabled = p.with_extension("rules.disabled-by-orca");
+        if fs::rename(p, &disabled).is_ok() {
+            done.push(format!(
+                "renamed blanket wake rule {} → {}",
+                p.display(),
+                disabled.display()
+            ));
+        } else {
+            manual.push(format!("sudo mv {} {}", p.display(), disabled.display()));
         }
     }
-    // Persistent udev rule (one match line per vendor:product).
-    let rule: String = culprits
-        .iter()
-        .filter_map(|c| c.id.split_once(':'))
-        .map(|(v, p)| {
-            format!(
-                "ACTION==\"add\", SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"{v}\", \
-                 ATTR{{idProduct}}==\"{p}\", ATTR{{power/wakeup}}=\"disabled\"\n"
-            )
-        })
-        .collect();
-    let rule_ok = fs::write(WAKEUP_RULE_PATH, &rule).is_ok();
 
-    if disabled == culprits.len() && rule_ok {
-        return (
+    // 2. Live-disable wakeup on controllers, root hubs, and radios.
+    let mut live_targets: Vec<PathBuf> = Vec::new();
+    live_targets.extend(controllers.iter().map(|c| c.wakeup_path.clone()));
+    live_targets.extend(radios.iter().map(|c| c.wakeup_path.clone()));
+    let (mut live_ok, mut live_total) = (0usize, 0usize);
+    for path in &live_targets {
+        live_total += 1;
+        if fs::write(path, "disabled").is_ok() {
+            live_ok += 1;
+        } else {
+            manual.push(format!("echo disabled | sudo tee {}", path.display()));
+        }
+    }
+    if live_total > 0 {
+        done.push(format!(
+            "live-disabled wakeup on {live_ok}/{live_total} USB device(s)"
+        ));
+    }
+
+    // 3. Persist the udev rules (controllers always; radios by id when present).
+    if fs::write(CONTROLLER_RULE_PATH, CONTROLLER_RULE_BODY).is_ok() {
+        done.push(format!("wrote {CONTROLLER_RULE_PATH}"));
+    } else {
+        manual.push(format!(
+            "sudo tee {CONTROLLER_RULE_PATH} <<'EOF'\n{CONTROLLER_RULE_BODY}EOF"
+        ));
+    }
+    if !radios.is_empty() {
+        let rule: String = radios
+            .iter()
+            .filter_map(|c| c.id.split_once(':'))
+            .map(|(v, p)| {
+                format!(
+                    "ACTION==\"add\", SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"{v}\", \
+                     ATTR{{idProduct}}==\"{p}\", ATTR{{power/wakeup}}=\"disabled\"\n"
+                )
+            })
+            .collect();
+        if fs::write(WAKEUP_RULE_PATH, &rule).is_ok() {
+            done.push(format!("wrote {WAKEUP_RULE_PATH}"));
+        } else {
+            manual.push(format!("sudo tee {WAKEUP_RULE_PATH} <<'EOF'\n{rule}EOF"));
+        }
+    }
+
+    // 4. Turn off Ethernet Wake-on-LAN. Prefer NetworkManager (it re-applies on
+    //    link-up); fall back to ethtool for the running state.
+    for n in &wol {
+        let nm = run(
+            "nmcli",
+            &["-g", "GENERAL.CONNECTION", "device", "show", &n.iface],
+        )
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "--");
+        let applied = match &nm {
+            Some(conn) => run(
+                "nmcli",
+                &[
+                    "connection",
+                    "modify",
+                    conn,
+                    "802-3-ethernet.wake-on-lan",
+                    "disable",
+                ],
+            )
+            .is_ok(),
+            None => run("ethtool", &["-s", &n.iface, "wol", "d"]).is_ok(),
+        };
+        if applied {
+            done.push(format!("disabled Wake-on-LAN on {}", n.iface));
+        } else {
+            manual.push(match &nm {
+                Some(conn) => format!(
+                    "sudo nmcli connection modify '{conn}' 802-3-ethernet.wake-on-lan disable && sudo nmcli connection up '{conn}'"
+                ),
+                None => format!("sudo ethtool -s {} wol d", n.iface),
+            });
+        }
+    }
+
+    // Reload udev so freshly-written rules take on the next device event.
+    run("udevadm", &["control", "--reload"]).ok();
+
+    if manual.is_empty() {
+        (
             true,
             format!(
-                "disabled USB wakeup on {disabled} device(s) and wrote {WAKEUP_RULE_PATH}; \
-                 suspend can now hold (verify: sync; sudo rtcwake -m no -s 30; sudo systemctl suspend)"
+                "quiesced wake sources: {}. Wake is now power-button-only \
+                 (verify: sync; sudo rtcwake -m no -s 45; sudo systemctl suspend)",
+                done.join("; ")
             ),
-        );
+        )
+    } else {
+        let did = if done.is_empty() {
+            String::new()
+        } else {
+            format!("did [{}]; ", done.join("; "))
+        };
+        (
+            false,
+            format!(
+                "{did}needs privilege for the rest — run:\n{}",
+                manual.join("\n")
+            ),
+        )
     }
-    // Partial/failed — emit the by-hand commands.
-    let live_cmds = culprits
-        .iter()
-        .map(|c| format!("echo disabled | sudo tee {}", c.wakeup_path.display()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    (
-        false,
-        format!(
-            "needs privilege (disabled {disabled}/{}, rule {}). Run:\n{live_cmds}\nsudo tee {WAKEUP_RULE_PATH} <<'EOF'\n{rule}EOF",
-            culprits.len(),
-            if rule_ok { "written" } else { "unwritten" }
-        ),
-    )
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────
@@ -818,6 +962,133 @@ fn wakeup_culprits() -> Vec<WakeCulprit> {
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// USB host controllers / root hubs left wake-armed. On AMD platforms USB wake
+/// routes through the controller (`pinctrl_amd`), so an armed controller bounces
+/// S3 even when every leaf device is quiesced — this is the layer that actually
+/// matters. Covers both the USB root hubs (`/sys/bus/usb/devices/usb*`) and the
+/// backing xHCI PCI functions (class `0x0c0330`).
+fn armed_usb_controllers() -> Vec<WakeCulprit> {
+    let mut out = Vec::new();
+    // USB root hubs: usb1, usb2, …
+    if let Ok(rd) = fs::read_dir("/sys/bus/usb/devices") {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("usb") {
+                continue;
+            }
+            let wakeup_path = e.path().join("power/wakeup");
+            if read_trim(&wakeup_path.to_string_lossy()).as_deref() == Some("enabled") {
+                out.push(WakeCulprit {
+                    id: name.clone().into_owned(),
+                    label: format!("root hub {name}"),
+                    wakeup_path,
+                });
+            }
+        }
+    }
+    // xHCI PCI controllers: class 0x0c0330.
+    if let Ok(rd) = fs::read_dir("/sys/bus/pci/devices") {
+        for e in rd.flatten() {
+            let dev = e.path();
+            if read_trim(&dev.join("class").to_string_lossy()).as_deref() != Some("0x0c0330") {
+                continue;
+            }
+            let wakeup_path = dev.join("power/wakeup");
+            if read_trim(&wakeup_path.to_string_lossy()).as_deref() == Some("enabled") {
+                let slot = e.file_name().to_string_lossy().into_owned();
+                out.push(WakeCulprit {
+                    id: slot.clone(),
+                    label: format!("xHCI {slot}"),
+                    wakeup_path,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// An Ethernet interface with Wake-on-LAN armed.
+struct WolNic {
+    iface: String,
+    /// ethtool `Wakes on:` flag string (e.g. `g` for magic-packet).
+    flags: String,
+}
+
+/// Physical Ethernet NICs whose `ethtool` "Wakes on:" is anything but `d`
+/// (disabled). A stray broadcast/ARP/magic packet on the LAN then PMEs the box
+/// awake. Skips virtual/loopback interfaces and no-ops when ethtool is absent.
+fn wol_nics() -> Vec<WolNic> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir("/sys/class/net") else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let iface = e.file_name().to_string_lossy().into_owned();
+        if iface == "lo"
+            || iface.starts_with("veth")
+            || iface.starts_with("docker")
+            || iface.starts_with("virbr")
+            || iface.starts_with("br-")
+        {
+            continue;
+        }
+        if !e.path().join("device").exists() {
+            continue; // virtual interface, no backing device
+        }
+        let Some(info) = run_ok("ethtool", &[&iface]) else {
+            continue; // ethtool missing or the NIC has no WoL — can't assess
+        };
+        if let Some(flags) = info
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Wakes on:"))
+        {
+            let flags = flags.trim();
+            if !flags.is_empty() && flags != "d" {
+                out.push(WolNic {
+                    iface,
+                    flags: flags.to_string(),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.iface.cmp(&b.iface));
+    out
+}
+
+/// udev rules that arm `power/wakeup=enabled` with no device scope (no
+/// `idVendor`/`idProduct`) — i.e. "enable wake for everything". These silently
+/// re-arm every device on each boot and undo any targeted fix, so they're the
+/// real root cause when suspend regresses. A *scoped* enable rule (a specific
+/// controller for wake-on-gamepad) is a deliberate choice and is NOT flagged.
+fn blanket_wake_rules() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir("/etc/udev/rules.d") else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("rules") {
+            continue;
+        }
+        let Ok(txt) = fs::read_to_string(&p) else {
+            continue;
+        };
+        let blanket = txt.lines().map(str::trim).any(|l| {
+            !l.starts_with('#')
+                && l.contains("power/wakeup}=\"enabled\"")
+                && !l.contains("idVendor")
+                && !l.contains("idProduct")
+        });
+        if blanket {
+            out.push(p);
+        }
+    }
+    out.sort();
     out
 }
 
@@ -989,12 +1260,45 @@ mod tests {
 
     #[test]
     fn repair_suspend_wakeup_is_idempotent_when_clean() {
-        // With no wake-enabled radios present (typical CI host), the repair is a
-        // no-op success rather than an error.
-        if wakeup_culprits().is_empty() {
+        // With no wake sources armed (typical CI host — no armed controllers,
+        // radios, WoL NICs, or blanket rules), the repair is a no-op success.
+        let clean = armed_usb_controllers().is_empty()
+            && wakeup_culprits().is_empty()
+            && wol_nics().is_empty()
+            && blanket_wake_rules().is_empty();
+        if clean {
             let (ok, msg) = repair_suspend_wakeup();
             assert!(ok);
-            assert!(msg.contains("no wake-enabled"));
+            assert!(msg.contains("no wake sources"));
+        }
+    }
+
+    #[test]
+    fn controllers_are_roothubs_or_xhci_pci() {
+        // Every flagged controller must be a USB root hub or an xHCI PCI slot,
+        // and expose a writable power/wakeup path.
+        for c in armed_usb_controllers() {
+            assert!(c.wakeup_path.ends_with("power/wakeup"));
+            assert!(!c.id.is_empty());
+        }
+    }
+
+    #[test]
+    fn blanket_rule_detection_ignores_scoped_enables() {
+        // A scoped enable (with idVendor/idProduct) is a deliberate choice and
+        // must never be reported as a blanket wake-arming rule.
+        for p in blanket_wake_rules() {
+            let txt = fs::read_to_string(&p).unwrap_or_default();
+            let has_blanket = txt.lines().map(str::trim).any(|l| {
+                !l.starts_with('#')
+                    && l.contains("power/wakeup}=\"enabled\"")
+                    && !l.contains("idVendor")
+            });
+            assert!(
+                has_blanket,
+                "{} flagged without a blanket enable line",
+                p.display()
+            );
         }
     }
 
