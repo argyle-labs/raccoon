@@ -1,9 +1,8 @@
-//! Dynamic (subprocess) entrypoint for the raccoon plugin.
+//! Subprocess entrypoint for the raccoon plugin.
 //!
 //! The toolkit's `serve_tool_plugin!` emits `fn main`, serving this plugin over
-//! the orca socket. Dynamic replacement for the retired cdylib export — the
-//! plugin is a `[[bin]]`, owns no runtime, and reaches orca only through the
-//! socket.
+//! the orca socket. The plugin is a `[[bin]]`, owns no runtime, and reaches orca
+//! only through the socket.
 //!
 //! Hybrid arm: an (empty) `raccoon.` tool surface plus the `diagnostics` domain
 //! backend. `target_compat` is empty — raccoon diagnoses whatever local gaming
