@@ -11,8 +11,9 @@ category = "gaming"
 name = "raccoon"
 path = "src/lib.rs"
 # `rlib` retains the in-crate `#[cfg(test)]` harness + lets the workspace use it
-# as a normal Rust lib. The plugin ships as a `[[bin]]` served over the orca
-# socket (see `src/main.rs`) — the retired cdylib export is gone.
+# as a normal Rust lib. The plugin ships as a `[[bin]]` (see `src/main.rs`) that
+# talks to the orca daemon over its Unix socket via `serve_tool_plugin!` from
+# plugin-toolkit. No FFI/cdylib.
 crate-type = ["rlib"]
 
 [[bin]]

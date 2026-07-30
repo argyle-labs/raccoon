@@ -1,5 +1,4 @@
-//! Detection + remediation for the gaming box — the typed port of the former
-//! `doctor.sh`/`tune.sh`. Each check returns an optional
+//! Detection + remediation for the gaming box. Each check returns an optional
 //! [`Finding`]; each repair id maps to a concrete action. Everything is
 //! synchronous (sysfs reads + short commands); the core proxy runs it on a
 //! blocking pool.
