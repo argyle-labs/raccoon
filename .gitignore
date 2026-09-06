@@ -2,3 +2,6 @@
 
 /target
 Cargo.lock merge=binary
+
+# local-dev orca override (never commit)
+/.cargo/config.toml

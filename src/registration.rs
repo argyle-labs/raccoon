@@ -1,34 +1,34 @@
-//! Domain-backend registration for the hybrid export.
+//! Diagnostics provider for the backend-only export.
 //!
-//! raccoon contributes one backend to orca's `contract` registries: a
-//! `diagnostics` provider (`raccoon.__diag.<op>`) exposing two ops —
-//! `diagnose` and `repair`. orca's loader installs a `DiagnosticsProxy` that
-//! routes those two ops back through the FFI `invoke`; [`backend_dispatch`]
-//! answers them.
+//! raccoon contributes one `diagnostics` domain provider (`raccoon`) exposing
+//! two ops — `diagnose` and `repair`. The typed [`DiagnosticsProvider`] impl
+//! delegates to the detection + remediation logic in [`crate::checks`]; the
+//! toolkit's `diagnostics::dispatch_op` handles op routing and arg (de)coding.
 
-use plugin_toolkit::abi::BackendDef;
-use plugin_toolkit::serde_json;
+use plugin_toolkit::contract::BoxFuture;
+use plugin_toolkit::contract::diagnostics::{
+    DiagnoseArgs, DiagnosticsProvider, Finding, RepairArgs, RepairOutcome,
+};
 
-const DIAG_PREFIX: &str = "raccoon.__diag";
+/// The diagnostics provider raccoon advertises.
+pub struct RaccoonDiagnostics;
 
-/// The single backend descriptor this plugin advertises.
-pub fn backends_json() -> String {
-    let defs = vec![BackendDef {
-        domain: "diagnostics".to_string(),
-        name: crate::PROVIDER.to_string(),
-        invoke_prefix: DIAG_PREFIX.to_string(),
-        ..Default::default()
-    }];
-    serde_json::to_string(&defs).unwrap_or_else(|_| "[]".to_string())
-}
+impl DiagnosticsProvider for RaccoonDiagnostics {
+    fn name(&self) -> &str {
+        crate::PROVIDER
+    }
 
-/// Answer `raccoon.__diag.{diagnose,repair}` calls the loader's proxy makes.
-/// Returns `None` for any name this plugin doesn't own (there are no others).
-pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
-    let op = name.strip_prefix(DIAG_PREFIX)?.strip_prefix('.')?;
-    Some(match op {
-        "diagnose" => crate::checks::diagnose(args_json),
-        "repair" => crate::checks::repair(args_json),
-        other => Err(format!("raccoon: unknown diagnostics op '{other}'")),
-    })
+    fn diagnose(
+        &self,
+        args: DiagnoseArgs,
+    ) -> BoxFuture<'_, plugin_toolkit::anyhow::Result<Vec<Finding>>> {
+        Box::pin(async move { Ok(crate::checks::diagnose_typed(args)) })
+    }
+
+    fn repair(
+        &self,
+        args: RepairArgs,
+    ) -> BoxFuture<'_, plugin_toolkit::anyhow::Result<RepairOutcome>> {
+        Box::pin(async move { Ok(crate::checks::repair_typed(args)) })
+    }
 }
