@@ -1,18 +1,17 @@
 //! Subprocess entrypoint for the raccoon plugin.
 //!
-//! The toolkit's `serve_tool_plugin!` emits `fn main`, serving this plugin over
-//! the orca socket. The plugin is a `[[bin]]`, owns no runtime, and reaches orca
-//! only through the socket.
-//!
-//! Hybrid arm: an (empty) `raccoon.` tool surface plus the `diagnostics` domain
-//! backend. `target_compat` is empty — raccoon diagnoses whatever local gaming
-//! box it runs on, so there's no external service version to gate against. The
-//! backend descriptor comes from [`raccoon::registration::backends_json`] and
-//! `raccoon.__diag.*` ops route through [`raccoon::registration::backend_dispatch`].
+//! A backend-only plugin: it advertises a single `diagnostics` domain provider
+//! and owns no `raccoon.` tool surface. Running on the gaming machine it
+//! diagnoses, it emits typed findings + repairs through orca's diagnostics
+//! contract. The plugin is a `[[bin]]`, owns no runtime, and reaches orca only
+//! through the socket.
 
-plugin_toolkit::serve_tool_plugin! {
-    name: "raccoon",
-    target_compat: "",
-    backends: raccoon::registration::backends_json(),
-    backend_dispatch: raccoon::registration::backend_dispatch,
+plugin_toolkit::instrument::bootstrap!();
+use plugin_toolkit::plugin::Plugin;
+
+fn main() -> plugin_toolkit::anyhow::Result<()> {
+    Plugin::named("raccoon")
+        .version(env!("CARGO_PKG_VERSION"))
+        .diagnostics(raccoon::registration::RaccoonDiagnostics)
+        .serve()
 }

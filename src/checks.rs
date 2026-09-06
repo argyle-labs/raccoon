@@ -38,12 +38,18 @@ ACTION==\"add\", SUBSYSTEM==\"usb\", ATTR{idVendor}==\"1d6b\", ATTR{power/wakeup
 /// `provider` filter is already applied core-side, so args are ignored here.
 pub fn diagnose(_args_json: &str) -> Result<String, String> {
     // Validate args shape even though we don't branch on it (typed contract).
-    let _: DiagnoseArgs = if _args_json.trim().is_empty() {
+    let args: DiagnoseArgs = if _args_json.trim().is_empty() {
         DiagnoseArgs::default()
     } else {
         serde_json::from_str(_args_json).unwrap_or_default()
     };
-    let findings: Vec<Finding> = [
+    serde_json::to_string(&diagnose_typed(args)).map_err(|e| format!("encode findings: {e}"))
+}
+
+/// Run every check and return the typed findings. The `provider` filter is
+/// applied core-side, so args are ignored here.
+pub fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
+    [
         check_alsa_headroom(),
         check_cpu_mode(),
         check_scx(),
@@ -57,8 +63,7 @@ pub fn diagnose(_args_json: &str) -> Result<String, String> {
     ]
     .into_iter()
     .flatten()
-    .collect();
-    serde_json::to_string(&findings).map_err(|e| format!("encode findings: {e}"))
+    .collect()
 }
 
 fn finding(
@@ -666,6 +671,11 @@ fn repair_gaming_stack() -> (bool, String) {
 pub fn repair(args_json: &str) -> Result<String, String> {
     let args: RepairArgs =
         serde_json::from_str(args_json).map_err(|e| format!("invalid repair args: {e}"))?;
+    serde_json::to_string(&repair_typed(args)).map_err(|e| format!("encode outcome: {e}"))
+}
+
+/// Run one repair by id and return the typed [`RepairOutcome`].
+pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
     let (ok, message) = match args.repair_id.as_str() {
         "alsa-headroom" => repair_alsa_headroom(),
         "cpu-mode" => repair_cpu_mode(),
@@ -677,13 +687,12 @@ pub fn repair(args_json: &str) -> Result<String, String> {
         "gaming-stack" => repair_gaming_stack(),
         other => (false, format!("raccoon has no repair '{other}'")),
     };
-    let outcome = RepairOutcome {
+    RepairOutcome {
         id: args.repair_id,
         provider: crate::PROVIDER.to_string(),
         ok,
         message,
-    };
-    serde_json::to_string(&outcome).map_err(|e| format!("encode outcome: {e}"))
+    }
 }
 
 fn repair_alsa_headroom() -> (bool, String) {
