@@ -612,8 +612,15 @@ fn check_os_updates() -> Option<Finding> {
 /// staged image is inert until the operator reboots — the two states report
 /// separately.
 fn image_updates() -> Finding {
-    let booted = deployment("booted").unwrap_or_else(|| "unknown".to_string());
-    if let Some(staged) = deployment("staged") {
+    let status = rpm_ostree_status();
+    let booted = status
+        .as_ref()
+        .and_then(|s| deployment_version(s, "booted"))
+        .unwrap_or_else(|| "unknown".to_string());
+    if let Some(staged) = status
+        .as_ref()
+        .and_then(|s| deployment_version(s, "staged"))
+    {
         return finding(
             "os-updates",
             Severity::Warn,
@@ -621,6 +628,35 @@ fn image_updates() -> Finding {
             format!("staged {staged}, booted {booted}; a reboot runs it"),
             None,
         );
+    }
+    let repair = Some(repair_spec(
+        "os-updates",
+        "Stage the newer image with rpm-ostree upgrade; rebooting stays an operator act",
+        false,
+        true,
+    ));
+    // The registry digest is the one reading an unprivileged daemon can do:
+    // rpm-ostree's own `upgrade --check` goes through polkit and is refused.
+    if let Some((image, running)) = status.as_ref().and_then(booted_image)
+        && let Some(remote) = remote_digest(&image)
+    {
+        return if remote == running {
+            finding(
+                "os-updates",
+                Severity::Ok,
+                "OS image current",
+                format!("booted {booted} from {image}, matching the tag's digest"),
+                None,
+            )
+        } else {
+            finding(
+                "os-updates",
+                Severity::Warn,
+                "OS image update available",
+                format!("booted {booted} from {image}; the tag now points at {remote}"),
+                repair,
+            )
+        };
     }
     // `rpm-ostree upgrade --check` exits 77 when the remote holds nothing newer.
     match run_status("rpm-ostree", &["upgrade", "--check"]) {
@@ -631,34 +667,20 @@ fn image_updates() -> Finding {
             format!("booted {booted}; the remote holds nothing newer"),
             None,
         ),
-        Some((0, out)) => finding(
+        Some((0, _)) => finding(
             "os-updates",
             Severity::Warn,
             "OS image update available",
-            format!(
-                "booted {booted}; newer on the remote: {}",
-                out.lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("")
-                    .trim()
-            ),
-            Some(repair_spec(
-                "os-updates",
-                "Stage the newer image with rpm-ostree upgrade; rebooting stays an operator act",
-                false,
-                true,
-            )),
+            format!("booted {booted}; the remote holds a newer image"),
+            repair,
         ),
         Some((code, out)) => finding(
             "os-updates",
             Severity::Info,
             "OS update check inconclusive",
             format!(
-                "rpm-ostree upgrade --check exited {code}: {}",
-                out.lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("")
-                    .trim()
+                "digest comparison unavailable and rpm-ostree upgrade --check exited {code}: {}",
+                first_line(&out)
             ),
             None,
         ),
@@ -731,34 +753,67 @@ fn arch_updates() -> Finding {
             "os-updates",
             Severity::Info,
             "OS update check inconclusive",
-            format!(
-                "checkupdates exited {code}: {}",
-                out.lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("")
-                    .trim()
-            ),
+            format!("checkupdates exited {code}: {}", first_line(&out)),
             None,
         ),
     }
 }
 
-/// `version` (falling back to a short checksum) of the `rpm-ostree` deployment
-/// carrying the given flag — `"booted"` or `"staged"`.
-fn deployment(flag: &str) -> Option<String> {
-    let out = run_ok("rpm-ostree", &["status", "--json"])?;
-    let status: serde_json::Value = serde_json::from_str(&out).ok()?;
-    let d = status
+fn rpm_ostree_status() -> Option<serde_json::Value> {
+    serde_json::from_str(&run_ok("rpm-ostree", &["status", "--json"])?).ok()
+}
+
+/// The deployment carrying the given flag — `"booted"` or `"staged"`. Every
+/// deployment lists both keys, so only `true` selects one.
+fn deployment<'a>(status: &'a serde_json::Value, flag: &str) -> Option<&'a serde_json::Value> {
+    status
         .get("deployments")?
         .as_array()?
         .iter()
-        .find(|d| d.get(flag).and_then(serde_json::Value::as_bool) == Some(true))?;
+        .find(|d| d.get(flag).and_then(serde_json::Value::as_bool) == Some(true))
+}
+
+/// `version` (falling back to a short checksum) of the flagged deployment.
+fn deployment_version(status: &serde_json::Value, flag: &str) -> Option<String> {
+    let d = deployment(status, flag)?;
     if let Some(v) = d.get("version").and_then(serde_json::Value::as_str) {
         return Some(v.to_string());
     }
     d.get("checksum")
         .and_then(serde_json::Value::as_str)
         .map(|c| c.chars().take(12).collect())
+}
+
+/// The booted deployment's registry image and the manifest digest it runs.
+/// `container-image-reference` carries an ostree transport prefix
+/// (`ostree-image-signed:docker://ghcr.io/…`) that skopeo does not take.
+fn booted_image(status: &serde_json::Value) -> Option<(String, String)> {
+    let d = deployment(status, "booted")?;
+    let raw = d
+        .get("container-image-reference")
+        .and_then(serde_json::Value::as_str)?;
+    let reference = raw.split_once(':').map_or(raw, |(_, r)| r);
+    let image = reference.strip_prefix("docker://").unwrap_or(reference);
+    let digest = d
+        .get("base-commit-meta")?
+        .get("ostree.manifest-digest")
+        .and_then(serde_json::Value::as_str)?;
+    Some((image.to_string(), digest.to_string()))
+}
+
+/// Manifest digest the image's tag currently points at.
+fn remote_digest(image: &str) -> Option<String> {
+    let target = format!("docker://{image}");
+    let out = run_ok("skopeo", &["inspect", "--format", "{{.Digest}}", &target])?;
+    let digest = out.trim();
+    (!digest.is_empty()).then(|| digest.to_string())
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
 }
 
 /// Privileged package install, non-interactive. paru→pacman (never run paru as
@@ -871,14 +926,21 @@ fn repair_os_updates() -> (bool, String) {
         return match run("sudo", &["-n", "rpm-ostree", "upgrade"]) {
             Ok(_) => (
                 true,
-                match deployment("staged") {
+                match rpm_ostree_status()
+                    .as_ref()
+                    .and_then(|s| deployment_version(s, "staged"))
+                {
                     Some(v) => format!("staged {v}; a reboot runs it"),
                     None => "rpm-ostree reports the host already current".to_string(),
                 },
             ),
+            // rpm-ostree mutations go through polkit, which refuses a
+            // non-interactive caller on a workstation.
             Err(e) => (
                 false,
-                format!("staging failed ({e}); run: sudo rpm-ostree upgrade"),
+                format!(
+                    "staging failed ({e}); run: sudo rpm-ostree upgrade, then reboot when idle"
+                ),
             ),
         };
     }
@@ -1480,11 +1542,53 @@ mod tests {
     fn staged_image_updates_offer_no_repair() {
         // A staged deployment is already applied; only a reboot remains, and
         // that stays with the operator.
-        if deployment("staged").is_some() && which("rpm-ostree").is_some() {
+        if let Some(status) = rpm_ostree_status()
+            && deployment_version(&status, "staged").is_some()
+        {
             let f = image_updates();
             assert!(f.repair.is_none());
             assert!(f.detail.contains("staged"));
         }
+    }
+
+    /// `rpm-ostree status --json` as bragi reports it: the image reference wears
+    /// an ostree transport prefix, and only the booted deployment flags `true`.
+    const BRAGI_STATUS: &str = r#"{"deployments":[
+        {"booted":true,"staged":false,"version":"44.20260921",
+         "container-image-reference":"ostree-image-signed:docker://ghcr.io/ublue-os/bazzite-deck:stable",
+         "base-commit-meta":{"ostree.manifest-digest":"sha256:bb91fb"}},
+        {"booted":false,"staged":false,"version":"44.20260919"}]}"#;
+
+    #[test]
+    fn booted_deployment_is_the_flagged_one() {
+        let status: serde_json::Value = serde_json::from_str(BRAGI_STATUS).unwrap();
+        assert_eq!(
+            deployment_version(&status, "booted").as_deref(),
+            Some("44.20260921")
+        );
+        // `"staged": false` on every deployment must select none.
+        assert!(deployment_version(&status, "staged").is_none());
+    }
+
+    #[test]
+    fn booted_image_strips_the_ostree_transport_prefix() {
+        let status: serde_json::Value = serde_json::from_str(BRAGI_STATUS).unwrap();
+        let (image, digest) = booted_image(&status).expect("booted image");
+        // skopeo takes a registry reference; the prefix and `docker://` are ours to drop.
+        assert_eq!(image, "ghcr.io/ublue-os/bazzite-deck:stable");
+        assert_eq!(digest, "sha256:bb91fb");
+    }
+
+    #[test]
+    fn unverified_registry_references_parse_too() {
+        let status: serde_json::Value = serde_json::from_str(
+            r#"{"deployments":[{"booted":true,
+                "container-image-reference":"ostree-unverified-registry:ghcr.io/ublue-os/bazzite:stable",
+                "base-commit-meta":{"ostree.manifest-digest":"sha256:abc"}}]}"#,
+        )
+        .unwrap();
+        let (image, _) = booted_image(&status).expect("booted image");
+        assert_eq!(image, "ghcr.io/ublue-os/bazzite:stable");
     }
 
     #[test]
