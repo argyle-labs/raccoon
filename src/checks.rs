@@ -60,6 +60,7 @@ pub fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         check_dev_toolchain(),
         check_kde_apps(),
         check_gaming_stack(),
+        check_os_updates(),
     ]
     .into_iter()
     .flatten()
@@ -595,6 +596,171 @@ fn check_gaming_stack() -> Option<Finding> {
     ))
 }
 
+/// Pending OS updates. Probe-only: this reads update metadata, leaving the
+/// host's sync database and deployments untouched.
+fn check_os_updates() -> Option<Finding> {
+    if which("rpm-ostree").is_some() {
+        return Some(image_updates());
+    }
+    if which("pacman").is_some() {
+        return Some(arch_updates());
+    }
+    None
+}
+
+/// Image-based hosts (Bazzite) boot one deployment and stage the next, so a
+/// staged image is inert until the operator reboots — the two states report
+/// separately.
+fn image_updates() -> Finding {
+    let booted = deployment("booted").unwrap_or_else(|| "unknown".to_string());
+    if let Some(staged) = deployment("staged") {
+        return finding(
+            "os-updates",
+            Severity::Warn,
+            "OS update staged for the next boot",
+            format!("staged {staged}, booted {booted}; a reboot runs it"),
+            None,
+        );
+    }
+    // `rpm-ostree upgrade --check` exits 77 when the remote holds nothing newer.
+    match run_status("rpm-ostree", &["upgrade", "--check"]) {
+        Some((77, _)) => finding(
+            "os-updates",
+            Severity::Ok,
+            "OS image current",
+            format!("booted {booted}; the remote holds nothing newer"),
+            None,
+        ),
+        Some((0, out)) => finding(
+            "os-updates",
+            Severity::Warn,
+            "OS image update available",
+            format!(
+                "booted {booted}; newer on the remote: {}",
+                out.lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim()
+            ),
+            Some(repair_spec(
+                "os-updates",
+                "Stage the newer image with rpm-ostree upgrade; rebooting stays an operator act",
+                false,
+                true,
+            )),
+        ),
+        Some((code, out)) => finding(
+            "os-updates",
+            Severity::Info,
+            "OS update check inconclusive",
+            format!(
+                "rpm-ostree upgrade --check exited {code}: {}",
+                out.lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim()
+            ),
+            None,
+        ),
+        None => finding(
+            "os-updates",
+            Severity::Info,
+            "OS update check inconclusive",
+            "rpm-ostree is on PATH but would not run".to_string(),
+            None,
+        ),
+    }
+}
+
+/// Arch/CachyOS hosts. `checkupdates` compares against a private copy of the
+/// sync database, so the probe leaves the host's own database alone.
+fn arch_updates() -> Finding {
+    let Some((code, out)) = run_status("checkupdates", &[]) else {
+        return finding(
+            "os-updates",
+            Severity::Info,
+            "Pending-update check unavailable",
+            "checkupdates (pacman-contrib) lists pending packages without refreshing the host's sync database".to_string(),
+            Some(repair_spec(
+                "os-updates-probe",
+                "Install pacman-contrib via pacman (privileged)",
+                false,
+                true,
+            )),
+        );
+    };
+    // checkupdates exits 2 when every package is current.
+    match code {
+        2 => finding(
+            "os-updates",
+            Severity::Ok,
+            "Packages current",
+            "checkupdates lists no pending packages".to_string(),
+            None,
+        ),
+        0 => {
+            let pending: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+            let head: Vec<&str> = pending
+                .iter()
+                .take(5)
+                .map(|l| l.split_whitespace().next().unwrap_or(l))
+                .collect();
+            finding(
+                "os-updates",
+                Severity::Warn,
+                "Package updates pending",
+                format!(
+                    "{} pending: {}{}",
+                    pending.len(),
+                    head.join(", "),
+                    if pending.len() > head.len() {
+                        ", …"
+                    } else {
+                        ""
+                    }
+                ),
+                Some(repair_spec(
+                    "os-updates",
+                    "Full system upgrade via pacman -Syu (privileged); a rolling release upgrades as a whole",
+                    false,
+                    true,
+                )),
+            )
+        }
+        _ => finding(
+            "os-updates",
+            Severity::Info,
+            "OS update check inconclusive",
+            format!(
+                "checkupdates exited {code}: {}",
+                out.lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim()
+            ),
+            None,
+        ),
+    }
+}
+
+/// `version` (falling back to a short checksum) of the `rpm-ostree` deployment
+/// carrying the given flag — `"booted"` or `"staged"`.
+fn deployment(flag: &str) -> Option<String> {
+    let out = run_ok("rpm-ostree", &["status", "--json"])?;
+    let status: serde_json::Value = serde_json::from_str(&out).ok()?;
+    let d = status
+        .get("deployments")?
+        .as_array()?
+        .iter()
+        .find(|d| d.get(flag).and_then(serde_json::Value::as_bool) == Some(true))?;
+    if let Some(v) = d.get("version").and_then(serde_json::Value::as_str) {
+        return Some(v.to_string());
+    }
+    d.get("checksum")
+        .and_then(serde_json::Value::as_str)
+        .map(|c| c.chars().take(12).collect())
+}
+
 /// Privileged package install, non-interactive. paru→pacman (never run paru as
 /// root). On failure, return the exact command to run by hand — plugins can't
 /// prompt for a sudo password.
@@ -685,6 +851,8 @@ pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
         "dev-toolchain" => repair_dev_toolchain(),
         "kde-apps" => repair_kde_apps(),
         "gaming-stack" => repair_gaming_stack(),
+        "os-updates" => repair_os_updates(),
+        "os-updates-probe" => pm_install(&["pacman-contrib"]),
         other => (false, format!("raccoon has no repair '{other}'")),
     };
     RepairOutcome {
@@ -693,6 +861,40 @@ pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
         ok,
         message,
     }
+}
+
+/// Apply OS updates. Image-based hosts get the update staged for the next boot;
+/// the reboot stays an operator act. Arch hosts upgrade as a whole, the only
+/// safe shape on a rolling release.
+fn repair_os_updates() -> (bool, String) {
+    if which("rpm-ostree").is_some() {
+        return match run("sudo", &["-n", "rpm-ostree", "upgrade"]) {
+            Ok(_) => (
+                true,
+                match deployment("staged") {
+                    Some(v) => format!("staged {v}; a reboot runs it"),
+                    None => "rpm-ostree reports the host already current".to_string(),
+                },
+            ),
+            Err(e) => (
+                false,
+                format!("staging failed ({e}); run: sudo rpm-ostree upgrade"),
+            ),
+        };
+    }
+    if which("pacman").is_some() {
+        return match run("sudo", &["-n", "pacman", "-Syu", "--noconfirm"]) {
+            Ok(_) => (true, "full system upgrade applied".to_string()),
+            Err(e) => (
+                false,
+                format!("upgrade failed ({e}); run: sudo pacman -Syu"),
+            ),
+        };
+    }
+    (
+        false,
+        "no supported OS update mechanism (rpm-ostree, pacman)".to_string(),
+    )
 }
 
 fn repair_alsa_headroom() -> (bool, String) {
@@ -1225,6 +1427,19 @@ fn run(bin: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Run a command and return its exit code with whichever stream carried output.
+/// Update probes signal state through the exit code — `rpm-ostree upgrade
+/// --check` exits 77 for "nothing newer", `checkupdates` exits 2 for "current".
+fn run_status(bin: &str, args: &[&str]) -> Option<(i32, String)> {
+    let out = Command::new(bin).args(args).output().ok()?;
+    let text = if out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    } else {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    Some((out.status.code().unwrap_or(-1), text))
+}
+
 /// Like [`run`] but returns `None` on any failure (for best-effort probes).
 fn run_ok(bin: &str, args: &[&str]) -> Option<String> {
     run(bin, args).ok()
@@ -1241,6 +1456,49 @@ mod tests {
         assert!(tuned_profile_for("balanced").is_some());
         assert!(tuned_profile_for("powersave").is_some());
         assert!(tuned_profile_for("bogus").is_none());
+    }
+
+    #[test]
+    fn os_update_check_is_skipped_without_a_supported_mechanism() {
+        // macOS build hosts carry neither rpm-ostree nor pacman.
+        if which("rpm-ostree").is_none() && which("pacman").is_none() {
+            assert!(check_os_updates().is_none());
+        }
+    }
+
+    #[test]
+    fn os_update_finding_is_probe_only_when_current() {
+        // A current host offers no repair: there is nothing to apply.
+        if let Some(f) = check_os_updates()
+            && f.severity == Severity::Ok
+        {
+            assert!(f.repair.is_none());
+        }
+    }
+
+    #[test]
+    fn staged_image_updates_offer_no_repair() {
+        // A staged deployment is already applied; only a reboot remains, and
+        // that stays with the operator.
+        if deployment("staged").is_some() && which("rpm-ostree").is_some() {
+            let f = image_updates();
+            assert!(f.repair.is_none());
+            assert!(f.detail.contains("staged"));
+        }
+    }
+
+    #[test]
+    fn arch_repair_upgrades_the_whole_system() {
+        // The repair description must commit to a full -Syu; a partial upgrade
+        // breaks a rolling release.
+        if which("pacman").is_some()
+            && let Some(r) = arch_updates().repair
+            && r.id == "os-updates"
+        {
+            assert!(r.description.contains("-Syu"));
+            assert!(r.privileged);
+            assert!(!r.automatic);
+        }
     }
 
     #[test]
