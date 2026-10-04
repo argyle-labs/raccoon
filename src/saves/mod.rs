@@ -1,45 +1,52 @@
 //! Game-save capture/restore primitives, independent of the backup seam.
 //!
-//! - [`sources`] discovers each game's saves on this host (Steam userdata +
-//!   Proton prefix, Heroic / umu wine prefixes, operator-configured native
-//!   dirs) under a host-independent game id, as one or more [`GameRoot`] parts.
-//! - [`walk`] enumerates the save-bearing files under a root (never a whole
-//!   wine prefix).
-//! - [`manifest`] copies those files into a payload with mtimes preserved and
-//!   records `{relpath, size, mtime, sha256}` per part plus the writer host.
+//! - [`ludusavi`] provisions and drives Ludusavi, which knows (via
+//!   PCGamingWiki) where each game keeps its saves on this host.
+//! - [`layout`] maps each found file to a host-independent `<part>:<rel>` key
+//!   (`wine-user:AppData/...`, `steam-userdata:<appid>/...`, `home:...`).
+//! - [`select`] applies orca's exclusions (caches, shared registry hives,
+//!   escaping symlinks, restore artifacts) on top of ludusavi's.
+//! - [`manifest`] copies the files into a payload with mtimes preserved and
+//!   records `{relpath, size, mtime, sha256}` per part plus title + writer host.
 //! - [`restore`] puts a payload back newest-wins: a newer local file is kept
 //!   and the incoming copy lands beside it as a conflict file.
 //!
 //! The manifest + [`restore::decide`] are the building blocks for cross-host
 //! save sync, so they carry no backup-seam types.
 
+pub mod layout;
+pub mod ludusavi;
 pub mod manifest;
 pub mod restore;
-pub mod sources;
-pub mod walk;
+pub mod select;
 
-use std::path::PathBuf;
+use plugin_toolkit::hash::sha256_hex;
 
-/// Which files under a [`GameRoot`] are saves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Filter {
-    /// Every regular file under the root.
-    All,
-    /// A wine user dir (`drive_c/users/<user>`): only the save-bearing subtrees.
-    WineUser,
-}
-
-/// One save root of a game on this host (a Steam game has a userdata part and
-/// a Proton-prefix part).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GameRoot {
-    /// Host-independent part id (`userdata/<steamid>`, `proton`, `prefix`,
-    /// `home/<$HOME-relative dir>`). Doubles as the part's directory in a
-    /// payload, so it is always a relative path of normal components.
-    pub part: String,
-    /// Directory the manifest's relpaths are relative to.
-    pub root: PathBuf,
-    pub filter: Filter,
+/// The backup instance for a ludusavi game title: identical on every host.
+/// Lowercase `[a-z0-9-]`; when the slug drops more than case and spaces
+/// (punctuation, accents), a short title hash keeps distinct titles distinct
+/// — a pure function of the title, so hosts never disagree.
+pub fn game_id(title: &str) -> String {
+    let mut slug = String::new();
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-').to_string();
+    let plain = title.to_ascii_lowercase().replace(' ', "-");
+    if !slug.is_empty() && plain == slug {
+        slug
+    } else {
+        let hash = &sha256_hex(title.as_bytes())[..8];
+        if slug.is_empty() {
+            format!("game-{hash}")
+        } else {
+            format!("{slug}-{hash}")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -86,5 +93,23 @@ pub(crate) mod testutil {
             .unwrap()
             .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::game_id;
+
+    #[test]
+    fn game_ids_are_stable_and_lossy_titles_are_hashed() {
+        assert_eq!(game_id("Hades"), "hades");
+        assert_eq!(game_id("Alan Wake 2"), "alan-wake-2");
+        assert_eq!(game_id("METAL SLUG 3"), "metal-slug-3");
+        let bg3 = game_id("Baldur's Gate 3");
+        assert!(bg3.starts_with("baldur-s-gate-3-") && bg3.len() == "baldur-s-gate-3-".len() + 8);
+        assert_ne!(game_id("Foo: Bar"), game_id("Foo Bar"));
+        assert_eq!(game_id("Foo: Bar"), game_id("Foo: Bar"));
+        assert!(game_id("ドラゴン").starts_with("game-"));
+        assert!(game_id("Hades  II").starts_with("hades-ii-"));
     }
 }

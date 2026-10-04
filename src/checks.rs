@@ -1463,7 +1463,7 @@ fn drm_cards(connectors: bool) -> Vec<PathBuf> {
     out
 }
 
-fn which(bin: &str) -> Option<PathBuf> {
+pub(crate) fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|d| d.join(bin))
@@ -1471,7 +1471,7 @@ fn which(bin: &str) -> Option<PathBuf> {
 }
 
 /// Run a command, returning combined stdout on success or an error string.
-fn run(bin: &str, args: &[&str]) -> Result<String, String> {
+pub(crate) fn run(bin: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new(bin)
         .args(args)
         .output()

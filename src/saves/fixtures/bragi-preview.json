@@ -1,0 +1,55 @@
+{
+  "overall": {
+    "totalGames": 5,
+    "totalBytes": 31,
+    "processedGames": 5,
+    "processedBytes": 31,
+    "changedGames": { "new": 5, "different": 0, "same": 0 }
+  },
+  "games": {
+    "Baldur's Gate 3": {
+      "decision": "Processed",
+      "change": "New",
+      "files": {
+        "{HOME}/.local/share/Steam/steamapps/compatdata/2371341689/pfx/drive_c/users/steamuser/AppData/Local/Larian Studios/Baldur's Gate 3/PlayerProfiles/Public/profile8.lsf": { "change": "New", "bytes": 3 }
+      },
+      "registry": {}
+    },
+    "Diablo IV": {
+      "decision": "Processed",
+      "change": "New",
+      "files": {
+        "{HOME}/Games/Battlenet/drive_c/users/steamuser/Documents/Diablo IV/Settings/LocalPrefs.txt": { "change": "New", "bytes": 4 }
+      },
+      "registry": {}
+    },
+    "ELDEN RING": {
+      "decision": "Processed",
+      "change": "New",
+      "files": {
+        "{HOME}/.local/share/Steam/steamapps/compatdata/1245620/pfx/drive_c/users/steamuser/AppData/Roaming/EldenRing/76561198025017384/ER0000.sl2": { "change": "New", "bytes": 5 },
+        "{HOME}/.local/share/Steam/userdata/64751656/1245620/remote/steam_autocloud.vdf": { "change": "New", "bytes": 4 }
+      },
+      "registry": {}
+    },
+    "Hades": {
+      "decision": "Processed",
+      "change": "New",
+      "files": {
+        "{HOME}/Games/Heroic/Prefixes/Hades/drive_c/users/steamuser/Documents/Saved Games/Hades/Profile1.sav": { "change": "New", "bytes": 4 },
+        "{HOME}/Games/Heroic/Prefixes/Hades/drive_c/users/steamuser/AppData/Local/Hades/Cache/blob.bin": { "change": "New", "bytes": 4 },
+        "{HOME}/Games/Heroic/Prefixes/Hades/user.reg": { "change": "New", "bytes": 3 },
+        "{HOME}/Games/Heroic/Prefixes/Hades/drive_c/users/steamuser/Documents/Saved Games/Hades/Profile9.sav": { "change": "New", "bytes": 4, "ignored": true }
+      },
+      "registry": {}
+    },
+    "Stardew Valley": {
+      "decision": "Processed",
+      "change": "New",
+      "files": {
+        "{HOME}/.config/StardewValley/Saves/Farm_1/Farm_1": { "change": "New", "bytes": 4 }
+      },
+      "registry": {}
+    }
+  }
+}

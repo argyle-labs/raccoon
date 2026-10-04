@@ -58,19 +58,31 @@ The plugin needs an orca daemon that provides the `diagnostics` domain
 
 ## Game-save backups
 
-raccoon also contributes the `game-saves` backup KIND. Each instance is one game,
-named the same on every host (`steam-<appid>`, `heroic-<prefix>`, `umu-<prefix>`,
-`battlenet`, `native-<dir>`), so hosts sharing a backup target share each game's
-history. Only save-bearing files are captured: Steam `userdata/<steamid>/<appid>`,
-and in wine prefixes `AppData/{Roaming,Local,LocalLow}`, `Documents` and
-`Saved Games`, minus caches. Restores are newest-wins: a newer local file is kept
-and the incoming copy lands beside it as `<name>.orca-conflict-<stamp>`. A prefix
-that doesn't exist yet on the restoring host is deferred, not fabricated.
+raccoon also contributes the `game-saves` backup KIND. Discovery is delegated to
+[Ludusavi](https://github.com/mtkennerly/ludusavi) (PCGamingWiki-backed): raccoon uses a
+`ludusavi` on PATH, or downloads the pinned release (v0.31.0, sha256-verified) into
+`~/.local/share/orca/raccoon/ludusavi/` and runs it with a private `--config` there —
+your own ludusavi config is never touched. Roots handed to it: Steam (plus library
+folders), Heroic (native + flatpak config) and every wine prefix under `~/Games`.
 
-Extra native save dirs (under `$HOME`) come from orca config:
+Each instance is one game, named from its ludusavi title (`hades`, `alan-wake-2`;
+titles with punctuation get a short hash suffix), so every host sharing a backup
+target files the same game under the same instance — whatever the prefix is called
+or which Steam shortcut id it got. Files are stored under portable keys
+(`wine-user:AppData/...`, `steam-userdata:<appid>/...`, `home:...`). Caches, a
+prefix's shared registry hives and symlinks leaving their root are excluded.
+
+Restores are newest-wins: a newer local file is kept and the incoming copy lands
+beside it as `<name>.orca-conflict-<stamp>`; identical files are left alone. A part
+whose wine prefix ludusavi can't find for that game on the restoring host is
+deferred, never fabricated.
+
+Saves ludusavi doesn't know can be added as custom games from orca config (`paths`
+entries are named after their last segment):
 
 ```bash
-orca config set game-saves native-paths '{"paths":["~/.local/share/factorio"]}'
+orca config set game-saves native-paths \
+  '{"games":[{"name":"Factorio","files":["~/.factorio/saves"]}],"paths":["~/.local/share/mygame"]}'
 ```
 
 ## The pathway

@@ -199,8 +199,8 @@ fn conflict_path(dst: &Path, stamp: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::saves::manifest::{capture, mtime_ns};
+    use crate::saves::select::SourceFile;
     use crate::saves::testutil::{TempDir, set_mtime_secs, write};
-    use crate::saves::{Filter, GameRoot};
 
     fn entry(mtime_ns: i64, size: u64, sha: &str) -> FileEntry {
         FileEntry {
@@ -256,12 +256,15 @@ mod tests {
         }
         let payload = t.path().join("payload");
         fs::create_dir_all(&payload).unwrap();
-        let games = vec![GameRoot {
-            part: "g".into(),
-            root: src,
-            filter: Filter::All,
-        }];
-        let (m, _, _) = capture(&games, &payload, "native", "bragi").unwrap();
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|(rel, _, _)| SourceFile {
+                part: "g",
+                rel: PathBuf::from(rel),
+                abs: src.join(rel),
+            })
+            .collect();
+        let (m, _, _) = capture(&sources, &payload, "game", "Game", "bragi").unwrap();
         (payload, m)
     }
 

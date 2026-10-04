@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use plugin_toolkit::serde_json;
 use serde::{Deserialize, Serialize};
 
-use super::{GameRoot, walk};
+use super::select::SourceFile;
 
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const FILES_DIR: &str = "files";
@@ -27,6 +27,8 @@ pub struct Manifest {
     pub version: u32,
     /// The game id (backup instance).
     pub instance: String,
+    /// The game's ludusavi title, which restore looks up on the local host.
+    pub title: String,
     /// Hostname that wrote this payload; the store's record has no writer field.
     pub host: String,
     /// RFC 3339 capture time.
@@ -37,7 +39,7 @@ pub struct Manifest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
-    /// `/`-separated, relative to the game's root.
+    /// `/`-separated, relative to the part's local anchor.
     pub relpath: String,
     pub size: u64,
     /// Nanoseconds since the Unix epoch.
@@ -50,7 +52,7 @@ pub struct FileEntry {
 pub struct CaptureStats {
     pub files: usize,
     pub bytes: u64,
-    /// Unreadable source entries that were left out.
+    /// Source files that vanished or went unreadable mid-capture.
     pub skipped: Vec<String>,
 }
 
@@ -78,50 +80,47 @@ impl Manifest {
     }
 }
 
-/// Copy every save file of `parts` into `payload_dir` (mtimes preserved) and
-/// write the manifest. Returns the manifest, its sha256, and capture stats.
+/// Copy `files` into `payload_dir` (mtimes preserved) and write the manifest.
+/// Returns the manifest, its sha256, and capture stats.
 pub fn capture(
-    parts: &[GameRoot],
+    files: &[SourceFile],
     payload_dir: &Path,
     instance: &str,
+    title: &str,
     host: &str,
 ) -> Result<(Manifest, String, CaptureStats), String> {
     let mut stats = CaptureStats::default();
-    let mut out = BTreeMap::new();
-    for game in parts {
-        let dest_root = payload_dir.join(FILES_DIR).join(checked_rel(&game.part)?);
-        let (files, skipped) = walk::save_files(&game.root, game.filter);
-        stats.skipped.extend(skipped);
-        let mut entries = Vec::with_capacity(files.len());
-        for rel in files {
-            let src = game.root.join(&rel);
-            let dst = dest_root.join(&rel);
-            match copy_with_mtime(&src, &dst) {
-                Ok(entry_mtime) => {
-                    let size = fs::metadata(&dst)
-                        .map_err(|e| format!("stat {}: {e}", dst.display()))?
-                        .len();
-                    let sha256 = plugin_toolkit::hash::sha256_file(&dst)
-                        .map_err(|e| format!("hash {}: {e:#}", dst.display()))?;
-                    stats.files += 1;
-                    stats.bytes += size;
-                    entries.push(FileEntry {
-                        relpath: slash_path(&rel),
-                        size,
-                        mtime_ns: entry_mtime,
-                        sha256,
-                    });
-                }
-                // A save vanishing or going unreadable mid-walk is a skip, not a
-                // failed backup.
-                Err(e) => stats.skipped.push(e),
+    let mut out: BTreeMap<String, Vec<FileEntry>> = BTreeMap::new();
+    for f in files {
+        let dst = payload_dir.join(FILES_DIR).join(f.part).join(&f.rel);
+        match copy_with_mtime(&f.abs, &dst) {
+            Ok(entry_mtime) => {
+                let size = fs::metadata(&dst)
+                    .map_err(|e| format!("stat {}: {e}", dst.display()))?
+                    .len();
+                let sha256 = plugin_toolkit::hash::sha256_file(&dst)
+                    .map_err(|e| format!("hash {}: {e:#}", dst.display()))?;
+                stats.files += 1;
+                stats.bytes += size;
+                out.entry(f.part.to_string()).or_default().push(FileEntry {
+                    relpath: slash_path(&f.rel),
+                    size,
+                    mtime_ns: entry_mtime,
+                    sha256,
+                });
             }
+            // A save vanishing between scan and copy is a skip, not a failed
+            // backup.
+            Err(e) => stats.skipped.push(e),
         }
-        out.insert(game.part.clone(), entries);
+    }
+    for entries in out.values_mut() {
+        entries.sort_by(|a, b| a.relpath.cmp(&b.relpath));
     }
     let manifest = Manifest {
         version: MANIFEST_VERSION,
         instance: instance.to_string(),
+        title: title.to_string(),
         host: host.to_string(),
         created: plugin_toolkit::time::now().to_rfc3339(),
         parts: out,
@@ -190,44 +189,39 @@ fn slash_path(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::saves::Filter;
     use crate::saves::testutil::{TempDir, set_mtime_secs, write};
 
     #[test]
     fn capture_copies_preserves_mtime_and_describes_files() {
         let t = TempDir::new();
         let root = t.path().join("prefix/drive_c/users/steamuser");
-        write(&root.join("AppData/Roaming/G/save.dat"), "hello");
-        write(&root.join("AppData/Local/G/Cache/c.bin"), "cache");
-        write(&root.join("windows/system32/k.dll"), "dll");
-        set_mtime_secs(&root.join("AppData/Roaming/G/save.dat"), 1_700_000_000);
+        let save = root.join("AppData/Roaming/G/save.dat");
+        write(&save, "hello");
+        set_mtime_secs(&save, 1_700_000_000);
         let payload = t.path().join("payload");
         fs::create_dir_all(&payload).unwrap();
 
-        let games = vec![GameRoot {
-            part: "proton".into(),
-            root: root.clone(),
-            filter: Filter::WineUser,
+        let files = vec![SourceFile {
+            part: "wine-user",
+            rel: PathBuf::from("AppData/Roaming/G/save.dat"),
+            abs: save,
         }];
-        let (m, sum, stats) = capture(&games, &payload, "steam-1234", "bragi").unwrap();
+        let (m, sum, stats) = capture(&files, &payload, "hades", "Hades", "bragi").unwrap();
 
-        assert_eq!(stats.files, 1);
-        assert_eq!(stats.bytes, 5);
-        assert_eq!(m.host, "bragi");
-        assert_eq!(m.instance, "steam-1234");
-        let entries = &m.parts["proton"];
-        assert_eq!(entries.len(), 1);
-        let e = &entries[0];
+        assert_eq!((stats.files, stats.bytes), (1, 5));
+        assert_eq!(
+            (m.host.as_str(), m.instance.as_str(), m.title.as_str()),
+            ("bragi", "hades", "Hades")
+        );
+        let e = &m.parts["wine-user"][0];
         assert_eq!(e.relpath, "AppData/Roaming/G/save.dat");
         assert_eq!(e.size, 5);
         assert_eq!(e.mtime_ns, 1_700_000_000 * 1_000_000_000);
         assert_eq!(e.sha256, plugin_toolkit::hash::sha256_hex(b"hello"));
 
-        let copied = payload.join("files/proton/AppData/Roaming/G/save.dat");
+        let copied = payload.join("files/wine-user/AppData/Roaming/G/save.dat");
         assert_eq!(fs::read_to_string(&copied).unwrap(), "hello");
         assert_eq!(mtime_ns(&copied).unwrap(), e.mtime_ns);
-        assert!(!payload.join("files/proton/windows").exists());
-        assert!(!payload.join("files/proton/AppData/Local/G/Cache").exists());
 
         let raw = fs::read(payload.join(MANIFEST_FILE)).unwrap();
         assert_eq!(sum, plugin_toolkit::hash::sha256_hex(&raw));

@@ -6,7 +6,8 @@
 //!   cache, and emits typed [`plugin_toolkit::contract::diagnostics::Finding`]s —
 //!   each with an optional repair the operator can run via `orca diagnostics repair`;
 //! - a `game-saves` backup KIND ([`game_saves`]) capturing/restoring per-game
-//!   saves, built on the host-independent primitives in [`saves`].
+//!   saves, discovered by Ludusavi and built on the host-independent
+//!   primitives in [`saves`].
 //!
 //! The detection + remediation logic lives in [`checks`]; [`registration`] wires
 //! both to their domains. The plugin is a `[[bin]]` that talks to the orca
