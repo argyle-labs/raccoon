@@ -10,7 +10,7 @@
 //!   `dispatch_kind_op` over [`GameSavesKind`].
 
 use plugin_toolkit::abi::BackendDef;
-use plugin_toolkit::backend_def::backup_kind_backend_def;
+use plugin_toolkit::backend_def::syncable_backup_kind_backend_def;
 use plugin_toolkit::backup::dispatch_kind_op;
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::diagnostics::{
@@ -24,9 +24,9 @@ use crate::game_saves::{GameSavesKind, KIND};
 /// Bridge invoke-prefix for the `game-saves` backup KIND.
 const BACKUP_PREFIX: &str = "raccoon.__backup_game_saves";
 
-/// The `backup_kind` backend def for `game-saves`.
+/// The `backup_kind` backend def for `game-saves`, opted into `backup.sync`.
 pub fn backup_backend_def() -> BackendDef {
-    crate::compat::syncable(backup_kind_backend_def(KIND, BACKUP_PREFIX))
+    syncable_backup_kind_backend_def(KIND, BACKUP_PREFIX)
 }
 
 /// Escape-hatch dispatcher for `raccoon.__backup_game_saves.*`. Returns `None`

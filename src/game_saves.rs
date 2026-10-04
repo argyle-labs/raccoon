@@ -4,7 +4,7 @@
 //! daemon's user — everything it touches lives under `$HOME`.
 //!
 //! Layout is the default flat `[kind, instance]` with no host segment: the
-//! writer host is recorded in the payload's manifest instead.
+//! writer host is recorded in the backup's record and the payload's manifest.
 //!
 //! Sync (`restore` latest, then `backup`) is safe to repeat: restore never
 //! overwrites local progress and backup publishes a merge, so a game played
@@ -23,7 +23,6 @@ use plugin_toolkit::contract::backup::BackupOutcome;
 use plugin_toolkit::serde_json;
 use serde::Deserialize;
 
-use crate::compat;
 use crate::saves::layout::{
     HOME, Layout, STEAM_COMMON, STEAM_USERDATA, WINE_C, WINE_USER, drive_of_user, prefix_dirs,
     user_of_drive,
@@ -212,15 +211,19 @@ pub fn backup_in(h: &Host, payload_dir: &Path, instance: &str) -> Result<BackupO
         format!("; {}", notes.join("; "))
     };
 
-    if plan.unchanged_from(last.as_ref())
-        && let Some(outcome) = compat::unchanged_outcome(&format!(
-            "{title} ({instance}) from {}: unchanged{suffix}",
-            h.hostname
-        ))
+    if let Some(published) = latest_published(payload_dir, instance)
+        && plan.unchanged_from(Some(&published))
     {
         record_local_base(&mut base, &sel, &plan.local_keys, &plan.parts);
         h.store.save_base(instance, &base)?;
-        return Ok(outcome);
+        if last.as_ref() != Some(&published) {
+            h.store.save_last(instance, &published)?;
+            h.store.prune_blobs(instance, &shas(&published))?;
+        }
+        return Ok(BackupOutcome::unchanged(Some(format!(
+            "{title} ({instance}) from {}: unchanged{suffix}",
+            h.hostname
+        ))));
     }
 
     let (manifest, checksum, stats) =
@@ -238,8 +241,6 @@ pub fn backup_in(h: &Host, payload_dir: &Path, instance: &str) -> Result<BackupO
     if !stats.skipped.is_empty() {
         plugin_toolkit::tracing::info!("[game-saves] {instance}: vanished {:?}", stats.skipped);
     }
-    // The spread keeps this compiling as the seam's outcome gains fields.
-    #[allow(clippy::needless_update)]
     Ok(BackupOutcome {
         checksum: Some(format!("sha256:{checksum}")),
         note: Some(format!(
@@ -256,6 +257,32 @@ pub fn backup_in(h: &Host, payload_dir: &Path, instance: &str) -> Result<BackupO
         )),
         ..Default::default()
     })
+}
+
+/// The core store's record file at a committed slot's root, beside `payload/`.
+const STORE_RECORD: &str = "manifest.json";
+
+/// The game-saves manifest of the newest committed backup of `instance` in the
+/// pool that holds `payload_dir` (`<pool>/<kind>/<instance>/<id>/payload`).
+/// Unchanged is judged against this rather than this host's `last`, which may
+/// name a slot the store never committed or a different target's pool.
+fn latest_published(payload_dir: &Path, instance: &str) -> Option<Manifest> {
+    let slot = payload_dir.parent()?;
+    let mut ids: Vec<(String, PathBuf)> = std::fs::read_dir(slot.parent()?)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let dir = e.path();
+            (!name.starts_with(".orca-") && dir != slot && dir.join(STORE_RECORD).is_file())
+                .then_some((name, dir))
+        })
+        .collect();
+    ids.sort();
+    let (_, newest) = ids.pop()?;
+    Manifest::read(&newest.join("payload"))
+        .ok()
+        .filter(|m| m.instance == instance)
 }
 
 /// Restore `instance` from `payload_dir`, possibly written by another host for
@@ -986,6 +1013,38 @@ mod tests {
                 .unwrap_err()
                 .contains("running")
         );
+    }
+
+    /// What the store does on commit: a record beside the payload.
+    fn commit(payload: &Path) {
+        write(&payload.parent().unwrap().join(STORE_RECORD), "{}");
+    }
+
+    #[test]
+    fn unchanged_is_judged_against_the_committed_pool_not_last() {
+        let t = TempDir::new();
+        let (b, _) = homes(&t);
+        let f = Fixture::new(BRAGI, &b);
+        f.materialize();
+        let h = host(&t, "bragi", &b, &f);
+
+        let s1 = slot(&t, "hades", 1);
+        assert!(!backup_in(&h, &s1, "hades").unwrap().unchanged);
+        let s2 = slot(&t, "hades", 2);
+        let out = backup_in(&h, &s2, "hades").unwrap();
+        assert!(!out.unchanged, "slot 1 was never committed");
+        assert!(Manifest::read(&s2).is_ok());
+
+        commit(&s2);
+        let s3 = slot(&t, "hades", 3);
+        let out = backup_in(&h, &s3, "hades").unwrap();
+        assert!(out.unchanged);
+        assert!(out.note.unwrap().contains("unchanged"));
+        assert!(Manifest::read(&s3).is_err());
+        assert_eq!(h.store.last("hades").unwrap(), Manifest::read(&s2).ok());
+
+        write(&b.join(HADES_BRAGI), "more progress");
+        assert!(!backup_in(&h, &s3, "hades").unwrap().unchanged);
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub struct Manifest {
     pub instance: String,
     /// The game's ludusavi title, which restore looks up on the local host.
     pub title: String,
-    /// Hostname that wrote this payload; the store's record has no writer field.
+    /// Hostname that wrote this payload.
     pub host: String,
     /// RFC 3339 capture time.
     pub created: String,
