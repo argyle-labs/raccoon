@@ -1,0 +1,19 @@
+{
+  "overall": {
+    "totalGames": 1,
+    "totalBytes": 4,
+    "processedGames": 1,
+    "processedBytes": 4,
+    "changedGames": { "new": 1, "different": 0, "same": 0 }
+  },
+  "games": {
+    "Hades": {
+      "decision": "Processed",
+      "change": "New",
+      "files": {
+        "{HOME}/Games/Heroic/Prefixes/default/drive_c/users/skey/Documents/Saved Games/Hades/Profile2.sav": { "change": "New", "bytes": 4 }
+      },
+      "registry": {}
+    }
+  }
+}

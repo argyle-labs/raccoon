@@ -56,6 +56,61 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu  # cross-compile for 
 The plugin needs an orca daemon that provides the `diagnostics` domain
 (≥ the release that adds it). See `docs/SETUP.md` for the per-check detail.
 
+## Game-save backups
+
+raccoon also contributes the `game-saves` backup KIND. Discovery is delegated to
+[Ludusavi](https://github.com/mtkennerly/ludusavi) (PCGamingWiki-backed). raccoon
+only ever runs the pinned release (v0.31.0): it downloads it once into
+`~/.local/share/orca/raccoon/ludusavi/`, checks the tarball's and the binary's
+pinned sha256, and runs it with a private `--config` there, so your own ludusavi
+setup is never touched. Roots handed to it: Steam (plus library folders), Heroic
+(native + flatpak config) and the non-Heroic wine prefixes under `~/Games`.
+
+Each instance is one game, named from its ludusavi title (`hades`, `alan-wake-2`;
+titles with punctuation get a short hash suffix), so every host sharing a backup
+target files the same game under the same instance. Files are stored under
+portable keys (`wine-user:AppData/...`, `steam-userdata:<appid>/...`, `home:...`),
+so a save lines up across hosts whatever its wine prefix is called (per-game, or
+Heroic's shared `default`) and whatever the wine user is named.
+
+Left out on purpose: caches, a prefix's registry hives (shared by every game in
+it — games with registry-only saves are noted in the backup), files ludusavi
+attributes to more than one game, symlinks leaving their root, and everything
+Steam Cloud already syncs (`userdata/<id>/<appid>/remote/` and Auto-Cloud dirs
+marked by `steam_autocloud.vdf`). Steam userdata is only ever written for apps
+installed on the restoring host.
+
+Sync safety. Each host remembers, per file, what it last synced (its *base*):
+
+- Restore replaces a local file only when it is untouched since the last sync,
+  moving the old bytes aside to `<name>.orca-replaced-<stamp>` (newest 3 kept).
+  Local progress is never overwritten: the incoming copy lands beside it as
+  `<name>.orca-conflict-<stamp>`, and if any file of a game's part conflicts,
+  nothing of that part is replaced.
+- Backup publishes the last synced state with local progress merged over it,
+  so a host that can't place part of a game (prefix not initialized, app not
+  installed) still publishes it from bytes it kept, and refuses rather than
+  publish it partial.
+- `home:` files are only restored beside the game's existing saves (or under
+  operator-configured paths), never onto shell startup files, `.ssh`,
+  autostart/systemd/environment.d, `~/.local/bin` or orca's own state.
+- Both refuse while the game looks to be running: a `/proc` scan of your
+  processes for one whose cwd, binary, command line or `WINEPREFIX` /
+  `STEAM_COMPAT_DATA_PATH` points into the game's prefix, install dir or save
+  dirs. A native game whose process touches none of those isn't detected, and a
+  lingering `wineserver` (or another game in a shared prefix) counts as running.
+
+Deleting a save on one host does not delete it elsewhere; the next restore
+brings it back.
+
+Saves ludusavi doesn't know can be added as custom games from orca config (bare
+`paths` entries are named after the whole path):
+
+```bash
+orca config set game-saves native-paths \
+  '{"games":[{"name":"Factorio","files":["~/.factorio/saves"]}],"paths":["~/.local/share/mygame"]}'
+```
+
 ## The pathway
 
 | Layer | Tool | Notes |
