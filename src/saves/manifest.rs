@@ -21,6 +21,8 @@ use super::fsx;
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const FILES_DIR: &str = "files";
 pub const MANIFEST_VERSION: u32 = 1;
+/// Largest manifest read; a pool file may come from another host or be crafted.
+pub const MANIFEST_MAX: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -59,7 +61,8 @@ pub struct CaptureStats {
 impl Manifest {
     pub fn read(payload_dir: &Path) -> Result<Self, String> {
         let path = payload_dir.join(MANIFEST_FILE);
-        let raw = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let raw = fsx::read_regular_capped(&path, MANIFEST_MAX)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
         let m: Self =
             serde_json::from_slice(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
         if m.version != MANIFEST_VERSION {

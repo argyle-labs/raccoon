@@ -25,9 +25,20 @@ pub struct MergePlan {
 }
 
 impl MergePlan {
-    /// Whether publishing would reproduce `last` exactly.
-    pub fn unchanged_from(&self, last: Option<&Manifest>) -> bool {
-        last.is_some_and(|m| m.parts == self.parts)
+    /// Whether publishing would reproduce `m`'s files: same paths, sizes and
+    /// hashes. Mtimes are not compared: a manifest's mtime is only what restore
+    /// stamps back, and the base records this host's own.
+    pub fn unchanged_from(&self, m: Option<&Manifest>) -> bool {
+        m.is_some_and(|m| {
+            m.parts.len() == self.parts.len()
+                && m.parts.iter().zip(&self.parts).all(|((pa, ea), (pb, eb))| {
+                    pa == pb
+                        && ea.len() == eb.len()
+                        && ea.iter().zip(eb).all(|(a, b)| {
+                            (&a.relpath, a.size, &a.sha256) == (&b.relpath, b.size, &b.sha256)
+                        })
+                })
+        })
     }
 }
 
@@ -235,6 +246,10 @@ mod tests {
         let p = plan(Some(&last), &Base::new(), &local, |s| Ok(t.path().join(s))).unwrap();
         assert!(p.unchanged_from(Some(&last)));
         assert!(!p.unchanged_from(None));
+        let restamped = manifest(&[("home", entry("a", "same", 7))]);
+        assert!(p.unchanged_from(Some(&restamped)));
+        let other = manifest(&[("home", entry("a", "diff", 5))]);
+        assert!(!p.unchanged_from(Some(&other)));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! copies into fresh files, durable atomic writes.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 /// Above this, a copy streams and hashes the written file instead of holding
@@ -51,6 +51,40 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fsync_dir(dir)
 }
 
+/// Read `path`, which must be a regular file (a symlink is refused, not
+/// followed) of at most `cap` bytes.
+pub fn read_regular_capped(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
+    let link = fs::symlink_metadata(path)?;
+    if !link.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    let f = File::open(path)?;
+    // A swap to a symlink between the lstat and the open shows as another inode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = f.metadata()?;
+        if (opened.dev(), opened.ino()) != (link.dev(), link.ino()) {
+            return Err(io::Error::other(format!(
+                "{} changed while opening",
+                path.display()
+            )));
+        }
+    }
+    let mut bytes = Vec::new();
+    f.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(io::Error::other(format!(
+            "{} is over {cap} bytes",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Persist a directory's entries (a rename is only durable once its dir is).
 pub fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
@@ -69,6 +103,20 @@ pub fn remove_quietly(path: &Path) {
 mod tests {
     use super::*;
     use crate::saves::testutil::{TempDir, write};
+
+    #[cfg(unix)]
+    #[test]
+    fn read_regular_capped_refuses_symlinks_and_oversize() {
+        let t = TempDir::new();
+        let f = t.path().join("f");
+        write(&f, "12345");
+        assert_eq!(read_regular_capped(&f, 5).unwrap(), b"12345");
+        assert!(read_regular_capped(&f, 4).is_err());
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&f, &link).unwrap();
+        assert!(read_regular_capped(&link, 5).is_err());
+        assert!(read_regular_capped(t.path(), 5).is_err());
+    }
 
     #[cfg(unix)]
     #[test]
