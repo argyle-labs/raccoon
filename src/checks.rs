@@ -1503,7 +1503,7 @@ fn run_status(bin: &str, args: &[&str]) -> Option<(i32, String)> {
 }
 
 /// Like [`run`] but returns `None` on any failure (for best-effort probes).
-fn run_ok(bin: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn run_ok(bin: &str, args: &[&str]) -> Option<String> {
     run(bin, args).ok()
 }
 

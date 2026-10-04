@@ -56,6 +56,23 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu  # cross-compile for 
 The plugin needs an orca daemon that provides the `diagnostics` domain
 (≥ the release that adds it). See `docs/SETUP.md` for the per-check detail.
 
+## Game-save backups
+
+raccoon also contributes the `game-saves` backup KIND. Each instance is one game,
+named the same on every host (`steam-<appid>`, `heroic-<prefix>`, `umu-<prefix>`,
+`battlenet`, `native-<dir>`), so hosts sharing a backup target share each game's
+history. Only save-bearing files are captured: Steam `userdata/<steamid>/<appid>`,
+and in wine prefixes `AppData/{Roaming,Local,LocalLow}`, `Documents` and
+`Saved Games`, minus caches. Restores are newest-wins: a newer local file is kept
+and the incoming copy lands beside it as `<name>.orca-conflict-<stamp>`. A prefix
+that doesn't exist yet on the restoring host is deferred, not fabricated.
+
+Extra native save dirs (under `$HOME`) come from orca config:
+
+```bash
+orca config set game-saves native-paths '{"paths":["~/.local/share/factorio"]}'
+```
+
 ## The pathway
 
 | Layer | Tool | Notes |
