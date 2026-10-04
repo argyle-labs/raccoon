@@ -14,7 +14,6 @@
 //! daemon over its Unix socket (`src/main.rs`).
 
 pub mod checks;
-pub mod compat;
 pub mod config;
 pub mod game_saves;
 pub mod process;
