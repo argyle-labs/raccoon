@@ -51,28 +51,23 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fsync_dir(dir)
 }
 
-/// Read `path`, which must be a regular file (a symlink is refused, not
-/// followed) of at most `cap` bytes.
+/// Read `path`, which must be a regular file of at most `cap` bytes. On unix a
+/// symlink at `path` is refused rather than followed, and a FIFO there cannot
+/// block the open.
 pub fn read_regular_capped(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
-    let link = fs::symlink_metadata(path)?;
-    if !link.file_type().is_file() {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let f = opts.open(path)?;
+    if !f.metadata()?.is_file() {
         return Err(io::Error::other(format!(
             "{} is not a regular file",
             path.display()
         )));
-    }
-    let f = File::open(path)?;
-    // A swap to a symlink between the lstat and the open shows as another inode.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let opened = f.metadata()?;
-        if (opened.dev(), opened.ino()) != (link.dev(), link.ino()) {
-            return Err(io::Error::other(format!(
-                "{} changed while opening",
-                path.display()
-            )));
-        }
     }
     let mut bytes = Vec::new();
     f.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
@@ -116,6 +111,11 @@ mod tests {
         std::os::unix::fs::symlink(&f, &link).unwrap();
         assert!(read_regular_capped(&link, 5).is_err());
         assert!(read_regular_capped(t.path(), 5).is_err());
+        let fifo = t.path().join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(read_regular_capped(&fifo, 5).is_err());
     }
 
     #[cfg(unix)]

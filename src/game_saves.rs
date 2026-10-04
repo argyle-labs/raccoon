@@ -263,51 +263,96 @@ pub fn backup_in(h: &Host, payload_dir: &Path, instance: &str) -> Result<BackupO
 /// The core store's record at a committed slot's root, beside [`PAYLOAD`].
 const STORE_RECORD: &str = "manifest.json";
 const PAYLOAD: &str = "payload";
+/// Store and target-plugin bookkeeping entries; the store never walks them.
+const RESERVED_PREFIX: &str = ".orca-";
 
 /// The game-saves manifest of the newest backup of `instance` the core store
 /// would list in the pool holding `payload_dir`, if that backup's payload is
 /// intact. Unchanged is judged against this rather than this host's `last`,
 /// which may name a slot the store never committed or another target's pool.
+/// Anything the store might read differently gives `None`, which publishes.
 ///
 /// Relies on the kind's flat `[kind, instance]` layout: `payload_dir` is
-/// `<pool>/<kind>/<instance>/<id>/payload`, so every slot of the instance is
-/// a sibling of its slot.
+/// `<pool>/<kind>/<instance>/<id>/payload`, and only the instance dir's
+/// subtree is searched for the instance's slots.
 fn latest_published(payload_dir: &Path, instance: &str) -> Option<Manifest> {
     if payload_dir.file_name()? != PAYLOAD {
         return None;
     }
-    let slot = payload_dir.parent()?;
-    let instance_dir = slot.parent()?;
-    let newest = std::fs::read_dir(instance_dir)
-        .ok()?
-        .flatten()
-        .filter(|e| e.path() != slot)
-        .filter_map(|e| committed_id(&e, instance))
-        .max()?;
-    let payload = instance_dir.join(newest).join(PAYLOAD);
-    if !std::fs::symlink_metadata(&payload)
-        .ok()?
-        .file_type()
-        .is_dir()
-    {
-        return None;
+    let instance_dir = payload_dir.parent()?.parent()?;
+    let kind_dir = instance_dir.parent()?;
+    // The store descends only real, unreserved dirs not named `payload`, and
+    // a dir holding a record is a slot it never descends into.
+    for dir in [kind_dir, instance_dir] {
+        let name = dir.file_name()?.to_string_lossy();
+        if name == PAYLOAD
+            || name.starts_with(RESERVED_PREFIX)
+            || !std::fs::symlink_metadata(dir).ok()?.file_type().is_dir()
+            || std::fs::symlink_metadata(dir.join(STORE_RECORD))
+                .is_ok_and(|m| m.file_type().is_file())
+        {
+            return None;
+        }
     }
+    let (_, newest) = slots_under(instance_dir, instance)?.into_iter().max()?;
+    let payload = newest?.join(PAYLOAD);
     let m = Manifest::read(&payload)
         .ok()
         .filter(|m| m.instance == instance)?;
     payload_intact(&payload, &m).then_some(m)
 }
 
-/// The slot id of `entry` if the core store counts it as a committed backup of
-/// `instance`: a real dir holding a regular-file record whose id is valid and
-/// names the dir. Mirrors the store's `load_manifest`.
-fn committed_id(entry: &std::fs::DirEntry, instance: &str) -> Option<String> {
-    let name = entry.file_name().into_string().ok()?;
-    if !entry.file_type().ok()?.is_dir() {
-        return None;
+/// Every slot under `root` as the store's `all_located` walk finds it, keyed
+/// by dir name: `Some(slot)` for a committed backup of `instance`, `None` for
+/// one whose record could not be read (which the store may read differently).
+/// Slots with an invalid record or another identity are left out. `None`
+/// overall when a dir in the walk can't be listed.
+fn slots_under(root: &Path, instance: &str) -> Option<Vec<(String, Option<PathBuf>)>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut subdirs = Vec::new();
+        let mut record = None;
+        for e in std::fs::read_dir(&dir).ok()? {
+            let e = e.ok()?;
+            let name = e.file_name();
+            if name.to_string_lossy().starts_with(RESERVED_PREFIX) {
+                continue;
+            }
+            let ft = e.file_type().ok()?;
+            if ft.is_dir() {
+                if name != PAYLOAD {
+                    subdirs.push(e.path());
+                }
+            } else if ft.is_file() && name == STORE_RECORD {
+                record = Some(e.path());
+            }
+        }
+        let Some(record) = record else {
+            stack.extend(subdirs);
+            continue;
+        };
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        match fsx::read_regular_capped(&record, MANIFEST_MAX) {
+            Err(_) => out.push((name.to_string(), None)),
+            Ok(raw) => {
+                if committed(&raw, name, instance) {
+                    out.push((name.to_string(), Some(dir.clone())));
+                }
+            }
+        }
     }
-    let raw = fsx::read_regular_capped(&entry.path().join(STORE_RECORD), MANIFEST_MAX).ok()?;
-    let rec: BackupRecord = serde_json::from_slice(&raw).ok()?;
+    Some(out)
+}
+
+/// Whether record bytes `raw` found in slot dir `name` are a committed backup
+/// of `instance` by the store's `load_manifest` rules.
+fn committed(raw: &[u8], name: &str, instance: &str) -> bool {
+    let Ok(rec) = serde_json::from_slice::<BackupRecord>(raw) else {
+        return false;
+    };
     let id_ok = !rec.id.is_empty()
         && rec.id.len() <= 255
         && !rec.id.starts_with('.')
@@ -315,12 +360,16 @@ fn committed_id(entry: &std::fs::DirEntry, instance: &str) -> Option<String> {
             .id
             .chars()
             .any(|c| std::path::is_separator(c) || c == '\0');
-    (id_ok && rec.id == name && rec.kind == KIND && rec.instance == instance).then_some(name)
+    id_ok && rec.id == name && rec.kind == KIND && rec.instance == instance
 }
 
 /// Every file `m` lists is in `payload` as a regular file of its recorded
-/// size, with no symlink on the way.
+/// size, with no symlink on the way. Hashes are not checked here; restore
+/// re-verifies each file's sha256.
 fn payload_intact(payload: &Path, m: &Manifest) -> bool {
+    if !std::fs::symlink_metadata(payload).is_ok_and(|m| m.file_type().is_dir()) {
+        return false;
+    }
     m.parts.iter().all(|(part, entries)| {
         entries.iter().all(|e| {
             let (Ok(part), Ok(rel)) = (checked_rel(part), checked_rel(&e.relpath)) else {
@@ -1223,6 +1272,106 @@ mod tests {
         assert_eq!(latest_published(&next, "hades"), Some(m));
         let not_payload = next.parent().unwrap().join("staging");
         assert_eq!(latest_published(&not_payload, "hades"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_search_walks_the_pool_as_the_store_does() {
+        let t = TempDir::new();
+        let (b, _) = homes(&t);
+        let f = Fixture::new(BRAGI, &b);
+        f.materialize();
+        let h = host(&t, "bragi", &b, &f);
+        let pool = t.path().join("pool");
+        let good = slot_at(&pool, "hades", "20261004-141751-bragi");
+        backup_in(&h, &good, "hades").unwrap();
+        commit(&good, "hades");
+        let want = Manifest::read(&good).ok();
+        let next = slot_at(&pool, "hades", "20261004-141752-bragi");
+        let instance_dir = pool.join(format!("{KIND}/hades"));
+        let at = |rel: &str| decoy(&good, rel, rel);
+
+        // Never descended: a dir named `payload`, and a slot whose record is
+        // invalid hides everything beneath it.
+        commit(&at("payload"), "hades");
+        let invalid = at("20261005-000000");
+        write(&invalid.parent().unwrap().join(STORE_RECORD), "{not json");
+        commit(&at("20261005-000000/20261006-000000"), "hades");
+        assert_eq!(latest_published(&next, "hades"), want);
+
+        // A slot nested in a plain dir is found, as the store finds it.
+        let nested = at("archive/20261005-000001");
+        commit(&nested, "hades");
+        let found = latest_published(&next, "hades").unwrap();
+        assert_eq!(found.host, "archive/20261005-000001");
+
+        // A newest-named record the cap refuses publishes rather than falls back.
+        let big = at("20261005-000002");
+        let mut raw = record("20261005-000002", KIND, "hades").into_bytes();
+        raw.resize(MANIFEST_MAX as usize + 1, b' ');
+        fs::write(big.parent().unwrap().join(STORE_RECORD), raw).unwrap();
+        assert_eq!(latest_published(&next, "hades"), None);
+        fs::remove_dir_all(big.parent().unwrap()).unwrap();
+        assert!(latest_published(&next, "hades").is_some());
+
+        // A record on the instance or kind dir makes it a slot to the store.
+        for dir in [instance_dir.clone(), pool.join(KIND)] {
+            write(&dir.join(STORE_RECORD), "{}");
+            assert_eq!(latest_published(&next, "hades"), None, "{}", dir.display());
+            fs::remove_file(dir.join(STORE_RECORD)).unwrap();
+        }
+        assert!(latest_published(&next, "hades").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payload_intact_needs_real_files_inside_the_payload() {
+        use std::os::unix::fs::symlink;
+        let t = TempDir::new();
+        let payload = t.path().join("slot/payload");
+        let files = payload.join(FILES_DIR);
+        write(&files.join("home/a/b.sav"), "save");
+        write(&files.join("x"), "save");
+        let with = |relpath: &str| Manifest {
+            version: crate::saves::manifest::MANIFEST_VERSION,
+            instance: "g".into(),
+            title: "G".into(),
+            host: "h".into(),
+            created: String::new(),
+            parts: [(
+                "home".to_string(),
+                vec![crate::saves::manifest::FileEntry {
+                    relpath: relpath.into(),
+                    size: 4,
+                    mtime_ns: 0,
+                    sha256: String::new(),
+                }],
+            )]
+            .into(),
+        };
+        assert!(payload_intact(&payload, &with("a/b.sav")));
+        assert!(!payload_intact(&payload, &with("a")));
+        assert!(!payload_intact(&payload, &with("../x")));
+        assert!(!payload_intact(
+            &payload,
+            &with(&files.join("x").display().to_string())
+        ));
+
+        let elsewhere = t.path().join("elsewhere");
+        fs::rename(&payload, &elsewhere).unwrap();
+        symlink(&elsewhere, &payload).unwrap();
+        assert!(!payload_intact(&payload, &with("a/b.sav")));
+        fs::remove_file(&payload).unwrap();
+        fs::rename(&elsewhere, &payload).unwrap();
+
+        let real_a = t.path().join("real-a");
+        fs::rename(files.join("home/a"), &real_a).unwrap();
+        symlink(&real_a, files.join("home/a")).unwrap();
+        assert!(!payload_intact(&payload, &with("a/b.sav")));
+        fs::remove_file(files.join("home/a")).unwrap();
+        fs::create_dir_all(files.join("home/a")).unwrap();
+        symlink(real_a.join("b.sav"), files.join("home/a/b.sav")).unwrap();
+        assert!(!payload_intact(&payload, &with("a/b.sav")));
     }
 
     #[test]
