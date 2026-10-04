@@ -19,16 +19,17 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use plugin_toolkit::backup::BackupKindPlugin;
-use plugin_toolkit::contract::backup::BackupOutcome;
+use plugin_toolkit::contract::backup::{BackupOutcome, BackupRecord};
 use plugin_toolkit::serde_json;
 use serde::Deserialize;
 
+use crate::saves::fsx;
 use crate::saves::layout::{
     HOME, Layout, STEAM_COMMON, STEAM_USERDATA, WINE_C, WINE_USER, drive_of_user, prefix_dirs,
     user_of_drive,
 };
 use crate::saves::ludusavi::{CustomGame, Ludusavi, Scanner};
-use crate::saves::manifest::{Manifest, capture, mtime_ns};
+use crate::saves::manifest::{FILES_DIR, MANIFEST_MAX, Manifest, capture, checked_rel, mtime_ns};
 use crate::saves::restore::{self, Placer, RestoreReport};
 use crate::saves::select::{self, STEAM_AUTOCLOUD, Selection};
 use crate::saves::state::{BaseEntry, Index, Store, key};
@@ -259,30 +260,92 @@ pub fn backup_in(h: &Host, payload_dir: &Path, instance: &str) -> Result<BackupO
     })
 }
 
-/// The core store's record file at a committed slot's root, beside `payload/`.
+/// The core store's record at a committed slot's root, beside [`PAYLOAD`].
 const STORE_RECORD: &str = "manifest.json";
+const PAYLOAD: &str = "payload";
 
-/// The game-saves manifest of the newest committed backup of `instance` in the
-/// pool that holds `payload_dir` (`<pool>/<kind>/<instance>/<id>/payload`).
-/// Unchanged is judged against this rather than this host's `last`, which may
-/// name a slot the store never committed or a different target's pool.
+/// The game-saves manifest of the newest backup of `instance` the core store
+/// would list in the pool holding `payload_dir`, if that backup's payload is
+/// intact. Unchanged is judged against this rather than this host's `last`,
+/// which may name a slot the store never committed or another target's pool.
+///
+/// Relies on the kind's flat `[kind, instance]` layout: `payload_dir` is
+/// `<pool>/<kind>/<instance>/<id>/payload`, so every slot of the instance is
+/// a sibling of its slot.
 fn latest_published(payload_dir: &Path, instance: &str) -> Option<Manifest> {
+    if payload_dir.file_name()? != PAYLOAD {
+        return None;
+    }
     let slot = payload_dir.parent()?;
-    let mut ids: Vec<(String, PathBuf)> = std::fs::read_dir(slot.parent()?)
+    let instance_dir = slot.parent()?;
+    let newest = std::fs::read_dir(instance_dir)
         .ok()?
         .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let dir = e.path();
-            (!name.starts_with(".orca-") && dir != slot && dir.join(STORE_RECORD).is_file())
-                .then_some((name, dir))
-        })
-        .collect();
-    ids.sort();
-    let (_, newest) = ids.pop()?;
-    Manifest::read(&newest.join("payload"))
+        .filter(|e| e.path() != slot)
+        .filter_map(|e| committed_id(&e, instance))
+        .max()?;
+    let payload = instance_dir.join(newest).join(PAYLOAD);
+    if !std::fs::symlink_metadata(&payload)
+        .ok()?
+        .file_type()
+        .is_dir()
+    {
+        return None;
+    }
+    let m = Manifest::read(&payload)
         .ok()
-        .filter(|m| m.instance == instance)
+        .filter(|m| m.instance == instance)?;
+    payload_intact(&payload, &m).then_some(m)
+}
+
+/// The slot id of `entry` if the core store counts it as a committed backup of
+/// `instance`: a real dir holding a regular-file record whose id is valid and
+/// names the dir. Mirrors the store's `load_manifest`.
+fn committed_id(entry: &std::fs::DirEntry, instance: &str) -> Option<String> {
+    let name = entry.file_name().into_string().ok()?;
+    if !entry.file_type().ok()?.is_dir() {
+        return None;
+    }
+    let raw = fsx::read_regular_capped(&entry.path().join(STORE_RECORD), MANIFEST_MAX).ok()?;
+    let rec: BackupRecord = serde_json::from_slice(&raw).ok()?;
+    let id_ok = !rec.id.is_empty()
+        && rec.id.len() <= 255
+        && !rec.id.starts_with('.')
+        && !rec
+            .id
+            .chars()
+            .any(|c| std::path::is_separator(c) || c == '\0');
+    (id_ok && rec.id == name && rec.kind == KIND && rec.instance == instance).then_some(name)
+}
+
+/// Every file `m` lists is in `payload` as a regular file of its recorded
+/// size, with no symlink on the way.
+fn payload_intact(payload: &Path, m: &Manifest) -> bool {
+    m.parts.iter().all(|(part, entries)| {
+        entries.iter().all(|e| {
+            let (Ok(part), Ok(rel)) = (checked_rel(part), checked_rel(&e.relpath)) else {
+                return false;
+            };
+            let rel = Path::new(FILES_DIR).join(part).join(rel);
+            let mut at = payload.to_path_buf();
+            let mut comps = rel.components().peekable();
+            while let Some(c) = comps.next() {
+                at.push(c);
+                let Ok(meta) = std::fs::symlink_metadata(&at) else {
+                    return false;
+                };
+                let ok = if comps.peek().is_some() {
+                    meta.file_type().is_dir()
+                } else {
+                    meta.file_type().is_file() && meta.len() == e.size
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            true
+        })
+    })
 }
 
 /// Restore `instance` from `payload_dir`, possibly written by another host for
@@ -585,7 +648,7 @@ fn hostname() -> String {
 mod tests {
     use super::*;
     use crate::saves::ludusavi::Preview;
-    use crate::saves::manifest::mtime_ns;
+    use crate::saves::manifest::{MANIFEST_FILE, mtime_ns};
     use crate::saves::testutil::{TempDir, set_mtime_secs, write};
     use std::cell::Cell;
     use std::fs;
@@ -1015,9 +1078,64 @@ mod tests {
         );
     }
 
-    /// What the store does on commit: a record beside the payload.
-    fn commit(payload: &Path) {
-        write(&payload.parent().unwrap().join(STORE_RECORD), "{}");
+    /// A pool slot with a core-shaped id (`YYYYMMDD-HHMMSS[-host][-N]`).
+    fn slot_at(pool: &Path, instance: &str, id: &str) -> PathBuf {
+        let p = pool.join(format!("{KIND}/{instance}/{id}/payload"));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn record(id: &str, kind: &str, instance: &str) -> String {
+        serde_json::to_string(&BackupRecord {
+            id: id.into(),
+            kind: kind.into(),
+            instance: instance.into(),
+            created_ms: 1,
+            path: PAYLOAD.into(),
+            size_bytes: 0,
+            file_count: 0,
+            checksum: None,
+            note: None,
+            system: String::new(),
+            writer: None,
+        })
+        .unwrap()
+    }
+
+    /// What the store's commit leaves: its record beside the payload, named
+    /// by the slot.
+    fn commit(payload: &Path, instance: &str) {
+        let slot = payload.parent().unwrap();
+        let id = slot.file_name().unwrap().to_str().unwrap();
+        write(&slot.join(STORE_RECORD), &record(id, KIND, instance));
+    }
+
+    /// A copy of `src`'s payload under slot `id`, its manifest marked by `host`.
+    fn decoy(src: &Path, id: &str, host: &str) -> PathBuf {
+        let dst = src
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(id)
+            .join(PAYLOAD);
+        copy_tree(src, &dst);
+        let mut m = Manifest::read(&dst).unwrap();
+        m.host = host.into();
+        m.write(&dst).unwrap();
+        dst
+    }
+
+    fn copy_tree(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).unwrap();
+        for e in fs::read_dir(src).unwrap().flatten() {
+            let to = dst.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_tree(&e.path(), &to);
+            } else {
+                fs::copy(e.path(), &to).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -1027,16 +1145,17 @@ mod tests {
         let f = Fixture::new(BRAGI, &b);
         f.materialize();
         let h = host(&t, "bragi", &b, &f);
+        let pool = t.path().join("pool");
 
-        let s1 = slot(&t, "hades", 1);
+        let s1 = slot_at(&pool, "hades", "20261004-141750-bragi");
         assert!(!backup_in(&h, &s1, "hades").unwrap().unchanged);
-        let s2 = slot(&t, "hades", 2);
+        let s2 = slot_at(&pool, "hades", "20261004-141750-bragi-1");
         let out = backup_in(&h, &s2, "hades").unwrap();
-        assert!(!out.unchanged, "slot 1 was never committed");
+        assert!(!out.unchanged, "the first slot was never committed");
         assert!(Manifest::read(&s2).is_ok());
 
-        commit(&s2);
-        let s3 = slot(&t, "hades", 3);
+        commit(&s2, "hades");
+        let s3 = slot_at(&pool, "hades", "20261004-141751-bragi");
         let out = backup_in(&h, &s3, "hades").unwrap();
         assert!(out.unchanged);
         assert!(out.note.unwrap().contains("unchanged"));
@@ -1045,6 +1164,129 @@ mod tests {
 
         write(&b.join(HADES_BRAGI), "more progress");
         assert!(!backup_in(&h, &s3, "hades").unwrap().unchanged);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_slots_the_store_would_list_count_as_published() {
+        use std::os::unix::fs::symlink;
+        let t = TempDir::new();
+        let (b, _) = homes(&t);
+        let f = Fixture::new(BRAGI, &b);
+        f.materialize();
+        let h = host(&t, "bragi", &b, &f);
+        let pool = t.path().join("pool");
+        let good = slot_at(&pool, "hades", "20261004-141751-bragi");
+        backup_in(&h, &good, "hades").unwrap();
+        commit(&good, "hades");
+        let want = Manifest::read(&good).ok();
+        let next = slot_at(&pool, "hades", "20261004-141752-bragi");
+
+        // Valid, but `-1` sorts below `-bragi` in the store's plain string order.
+        commit(&decoy(&good, "20261004-141751-1", "older"), "hades");
+        let dir_of = |p: &Path| p.parent().unwrap().to_path_buf();
+        let rec = |p: &Path, json: &str| write(&dir_of(p).join(STORE_RECORD), json);
+        let d = decoy(&good, "20261005-000000", "id-mismatch");
+        rec(&d, &record("20261005-000001", KIND, "hades"));
+        let d = decoy(&good, "20261005-000002", "other-instance");
+        rec(&d, &record("20261005-000002", KIND, "elden-ring"));
+        let d = decoy(&good, "20261005-000003", "other-kind");
+        rec(&d, &record("20261005-000003", "host", "hades"));
+        let d = decoy(&good, "20261005-000004", "invalid");
+        rec(&d, "{not json");
+        commit(&decoy(&good, ".orca-staging", "reserved"), "hades");
+        let d = decoy(&good, "20261005-000005", "record-link");
+        let outside = t.path().join("outside.json");
+        write(&outside, &record("20261005-000005", KIND, "hades"));
+        symlink(&outside, dir_of(&d).join(STORE_RECORD)).unwrap();
+        let d = decoy(&good, "20261005-000006", "slot-link");
+        commit(&d, "hades");
+        let real = t.path().join("elsewhere/20261005-000006");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::rename(dir_of(&d), &real).unwrap();
+        symlink(&real, dir_of(&d)).unwrap();
+        assert_eq!(latest_published(&next, "hades"), want);
+        assert!(backup_in(&h, &next, "hades").unwrap().unchanged);
+
+        // The newest valid slot alone decides: unreadable means publish.
+        let newest = slot_at(&pool, "hades", "20261006-000000-hemlock");
+        commit(&newest, "hades");
+        assert_eq!(latest_published(&next, "hades"), None);
+        let mut m = want.clone().unwrap();
+        m.host = "hemlock".into();
+        let mut raw = serde_json::to_vec(&m).unwrap();
+        raw.resize(MANIFEST_MAX as usize + 1, b' ');
+        fs::write(newest.join(MANIFEST_FILE), &raw).unwrap();
+        assert_eq!(latest_published(&next, "hades"), None);
+        copy_tree(&good.join(FILES_DIR), &newest.join(FILES_DIR));
+        m.write(&newest).unwrap();
+        assert_eq!(latest_published(&next, "hades"), Some(m));
+        let not_payload = next.parent().unwrap().join("staging");
+        assert_eq!(latest_published(&not_payload, "hades"), None);
+    }
+
+    #[test]
+    fn a_published_manifest_missing_payload_files_is_republished() {
+        let t = TempDir::new();
+        let (b, _) = homes(&t);
+        let f = Fixture::new(BRAGI, &b);
+        f.materialize();
+        let h = host(&t, "bragi", &b, &f);
+        let pool = t.path().join("pool");
+        let s1 = slot_at(&pool, "hades", "20261004-141750");
+        backup_in(&h, &s1, "hades").unwrap();
+        commit(&s1, "hades");
+        let m = Manifest::read(&s1).unwrap();
+        let e = &m.parts["wine-user"][0];
+        let file = s1.join(FILES_DIR).join("wine-user").join(&e.relpath);
+
+        fs::write(&file, "short").unwrap();
+        let s2 = slot_at(&pool, "hades", "20261004-141751");
+        assert!(!backup_in(&h, &s2, "hades").unwrap().unchanged);
+        fs::remove_dir_all(&s2).unwrap();
+
+        fs::remove_file(&file).unwrap();
+        let s2 = slot_at(&pool, "hades", "20261004-141751");
+        assert!(!backup_in(&h, &s2, "hades").unwrap().unchanged);
+        assert_eq!(Manifest::read(&s2).unwrap().parts, m.parts);
+    }
+
+    #[test]
+    fn deferred_parts_survive_an_unchanged_prune() {
+        let t = TempDir::new();
+        let (b, he) = homes(&t);
+        let (bf, hf) = (Fixture::new(BRAGI, &b), Fixture::new(HEMLOCK, &he));
+        bf.materialize();
+        hf.materialize();
+        let (bh, hh) = (host(&t, "bragi", &b, &bf), host(&t, "hemlock", &he, &hf));
+        let pool = t.path().join("pool");
+        let s1 = slot_at(&pool, "elden-ring", "20261004-141750-bragi");
+        backup_in(&bh, &s1, "elden-ring").unwrap();
+        commit(&s1, "elden-ring");
+        let bragi_parts = Manifest::read(&s1).unwrap().parts;
+        let r = restore_in(&hh, &s1, "elden-ring").unwrap();
+        assert_eq!(r.deferred.len(), 2, "{:?}", r.deferred);
+
+        // Same files as hemlock's last but not equal to it, so the unchanged
+        // path adopts it as last and prunes blobs to it.
+        commit(
+            &decoy(&s1, "20261004-141751-bragi", "bragi-again"),
+            "elden-ring",
+        );
+        let s2 = slot_at(&pool, "elden-ring", "20261004-141752-hemlock");
+        assert!(backup_in(&hh, &s2, "elden-ring").unwrap().unchanged);
+        assert_eq!(
+            hh.store.last("elden-ring").unwrap().unwrap().host,
+            "bragi-again"
+        );
+
+        let other = slot_at(
+            &t.path().join("other-pool"),
+            "elden-ring",
+            "20261004-141753",
+        );
+        assert!(!backup_in(&hh, &other, "elden-ring").unwrap().unchanged);
+        assert_eq!(Manifest::read(&other).unwrap().parts, bragi_parts);
     }
 
     #[test]
