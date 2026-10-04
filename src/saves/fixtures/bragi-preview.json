@@ -28,7 +28,7 @@
       "change": "New",
       "files": {
         "{HOME}/.local/share/Steam/steamapps/compatdata/1245620/pfx/drive_c/users/steamuser/AppData/Roaming/EldenRing/76561198025017384/ER0000.sl2": { "change": "New", "bytes": 5 },
-        "{HOME}/.local/share/Steam/userdata/64751656/1245620/remote/steam_autocloud.vdf": { "change": "New", "bytes": 4 }
+        "{HOME}/.local/share/Steam/userdata/64751656/1245620/local/settings.cfg": { "change": "New", "bytes": 4 }
       },
       "registry": {}
     },

@@ -13,9 +13,10 @@
 //! | `steam-common`   | `<library>/steamapps/common`             |
 //! | `home`           | `$HOME`                                  |
 //!
-//! So the same game's saves line up across hosts whatever the prefix is
-//! called (per-game vs Heroic's shared `default`), whatever shortcut id Steam
-//! assigned, and whatever the wine user is named.
+//! The key carries no prefix name, steamid or wine user name, so the same file
+//! keys identically on a host with per-game prefixes and on one with Heroic's
+//! shared `default`. (Steam shortcut ids never reach a key: compatdata paths
+//! classify as `wine-*`.)
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -114,14 +115,62 @@ impl Layout {
             .find(|c| c.join(dir).is_dir())
     }
 
-    /// Wine prefixes under `~/Games` (Battle.net, umu, Ubisoft Connect,
-    /// Heroic `Prefixes/*`), for ludusavi `otherWine` roots. A prefix is a dir
+    /// Wine prefixes under `~/Games` (Battle.net, umu, Ubisoft Connect, …)
+    /// for ludusavi `otherWine` roots. ludusavi checks every game it knows
+    /// against each such root, so `~/Games/Heroic` is left out: the `heroic`
+    /// root already maps each Heroic game to its own prefix. A prefix is a dir
     /// with `drive_c`; umu/Proton-style `<dir>/pfx/drive_c` yields `<dir>/pfx`.
     pub fn wine_prefixes(&self) -> Vec<PathBuf> {
         let mut out = Vec::new();
-        find_prefixes(&self.home.join("Games"), 3, &mut out);
+        let games = self.home.join("Games");
+        find_prefixes(&games, 3, &mut out);
+        out.retain(|p| !p.starts_with(games.join("Heroic")));
         out
     }
+
+    /// Whether Steam has app `appid` installed in any library.
+    pub fn steam_app_installed(&self, appid: &str) -> bool {
+        is_numeric(appid)
+            && self.steam_libraries.iter().any(|l| {
+                l.join(format!("steamapps/appmanifest_{appid}.acf"))
+                    .is_file()
+            })
+    }
+}
+
+/// The `wine-c` anchor (`<prefix>/drive_c`) for a `wine-user` anchor.
+pub fn drive_of_user(user_dir: &Path) -> Option<PathBuf> {
+    user_dir.parent()?.parent().map(Path::to_path_buf)
+}
+
+/// The prefix's user dir under `drive`: `steamuser` (Proton/umu), else the
+/// login name, else the first non-`Public` user.
+pub fn user_of_drive(drive: &Path, home: &Path) -> Option<PathBuf> {
+    let users = drive.join("users");
+    let login = home.file_name().map(|n| n.to_string_lossy().into_owned());
+    let names: Vec<String> = sorted_dirs(&users).into_iter().map(|(n, _)| n).collect();
+    let pick = names
+        .iter()
+        .find(|n| *n == "steamuser")
+        .or_else(|| names.iter().find(|n| Some(n.as_str()) == login.as_deref()))
+        .or_else(|| names.iter().find(|n| *n != "Public"))?;
+    Some(users.join(pick))
+}
+
+/// The prefix dir (holding `drive_c`) of an anchor inside it, plus Proton's
+/// `compatdata/<appid>` when the prefix is its `pfx`.
+pub fn prefix_dirs(anchor: &Path) -> Vec<PathBuf> {
+    let Some(at) = anchor.ancestors().find(|a| a.ends_with("drive_c")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = at.parent().into_iter().map(Path::to_path_buf).collect();
+    if let Some(p) = out.first()
+        && p.ends_with("pfx")
+        && let Some(compat) = p.parent()
+    {
+        out.push(compat.to_path_buf());
+    }
+    out
 }
 
 fn classify_wine(path: &Path) -> Option<Placement> {
@@ -336,8 +385,6 @@ mod tests {
             got,
             vec![
                 "Games/Battlenet",
-                "Games/Heroic/Prefixes/Alan Wake 2",
-                "Games/Heroic/Prefixes/default",
                 "Games/ubisoft-connect",
                 "Games/umu/umu-default/pfx",
             ]

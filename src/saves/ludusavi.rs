@@ -5,23 +5,42 @@
 //!
 //! Runs unprivileged out of a plugin-private dir
 //! (`~/.local/share/orca/raccoon/ludusavi`) with its own `--config`, so the
-//! user's own ludusavi setup is never read or touched.
+//! user's own ludusavi setup is never read or touched. Only the pinned release
+//! is ever run (never a `ludusavi` on PATH), verified once per process.
+//!
+//! Scan cost: ludusavi probes every game it knows against `$HOME` and against
+//! each `otherWine` root, so roots are kept to the explicit ones below and a
+//! full scan only refreshes the instance index; per-game work scans one title.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use plugin_toolkit::serde_json::{self, Value, json};
 use serde::Deserialize;
 
 use super::layout::Layout;
+use crate::process::run_bounded;
 
 pub const VERSION: &str = "0.31.0";
 const LINUX_X64_URL: &str = "https://github.com/mtkennerly/ludusavi/releases/download/v0.31.0/ludusavi-v0.31.0-linux.tar.gz";
-/// Upstream publishes no checksums, so the release tarball's sha256 is pinned
-/// here (computed from the v0.31.0 GitHub release asset).
+/// Upstream publishes no checksums, so the release tarball's and the extracted
+/// binary's sha256 are pinned here (computed from the v0.31.0 GitHub release
+/// asset).
 const LINUX_X64_SHA256: &str = "7322ff45d41eae7ae064a80d8c9ecccc5b8fb6fc090a603a66369cd4b054068d";
+const LINUX_X64_BIN_SHA256: &str =
+    "38098e1aec77d0976fc0644ce00a265392ab58ac00b949ddff437aa9b7606d43";
+
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+const TAR_TIMEOUT: Duration = Duration::from_secs(120);
+/// A full scan probes every known game; a title scan only that game.
+pub const FULL_SCAN_TIMEOUT: Duration = Duration::from_secs(900);
+pub const TITLE_SCAN_TIMEOUT: Duration = Duration::from_secs(180);
+
+static BINARY_VERIFIED: AtomicBool = AtomicBool::new(false);
 
 /// `backup --preview --api` output (ludusavi's `general-output` schema), cut
 /// down to what discovery reads.
@@ -41,11 +60,23 @@ pub struct PreviewGame {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreviewFile {
     #[serde(default)]
     pub failed: bool,
     #[serde(default)]
     pub ignored: bool,
+    /// Other games that claim the same path.
+    #[serde(default)]
+    pub duplicated_by: Vec<String>,
+    #[serde(default)]
+    pub error: Option<PreviewError>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PreviewError {
+    #[serde(default)]
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -53,6 +84,15 @@ pub struct PreviewFile {
 pub struct PreviewErrors {
     #[serde(default)]
     pub unknown_games: Option<Vec<String>>,
+    #[serde(default)]
+    pub some_games_failed: Option<bool>,
+}
+
+/// A file ludusavi found for a game.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanFile {
+    pub path: PathBuf,
+    pub duplicated_by: Vec<String>,
 }
 
 impl Preview {
@@ -61,23 +101,43 @@ impl Preview {
     }
 
     /// The files ludusavi would back up for `title`.
-    pub fn files(&self, title: &str) -> Vec<PathBuf> {
+    pub fn files(&self, title: &str) -> Vec<ScanFile> {
         self.games
             .get(title)
             .map(|g| {
                 g.files
                     .iter()
                     .filter(|(_, f)| !f.ignored && !f.failed)
-                    .map(|(p, _)| PathBuf::from(p))
+                    .map(|(p, f)| ScanFile {
+                        path: PathBuf::from(p),
+                        duplicated_by: f.duplicated_by.clone(),
+                    })
                     .collect()
             })
             .unwrap_or_default()
     }
+
+    /// What ludusavi reported going wrong (failed files, failed games).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(e) = &self.errors
+            && e.some_games_failed == Some(true)
+        {
+            out.push("ludusavi: some games failed".to_string());
+        }
+        for (title, g) in &self.games {
+            for (path, f) in g.files.iter().filter(|(_, f)| f.failed) {
+                let why = f.error.as_ref().map_or("failed", |e| e.message.as_str());
+                out.push(format!("ludusavi: {title}: {path}: {why}"));
+            }
+        }
+        out
+    }
 }
 
-/// A save scan: all games (`None`) or one title.
+/// A save scan of `titles`, or of every game when empty.
 pub trait Scanner {
-    fn preview(&self, title: Option<&str>) -> Result<Preview, String>;
+    fn preview(&self, titles: &[&str]) -> Result<Preview, String>;
 }
 
 /// An operator-defined game (from orca config) handed to ludusavi as a custom
@@ -130,7 +190,7 @@ pub fn config(layout: &Layout, custom: &[CustomGame], scratch: &Path) -> Value {
     })
 }
 
-fn expand_home(home: &Path, p: &str) -> String {
+pub fn expand_home(home: &Path, p: &str) -> String {
     match p.strip_prefix("~/").or_else(|| p.strip_prefix("$HOME/")) {
         Some(rest) => home.join(rest).to_string_lossy().into_owned(),
         None => p.to_string(),
@@ -144,7 +204,8 @@ pub struct Ludusavi {
 }
 
 impl Ludusavi {
-    /// Find or install ludusavi and (re)write its private config.
+    /// Install (first use) and verify the pinned ludusavi, and (re)write its
+    /// private config.
     pub fn prepare(layout: &Layout, custom: &[CustomGame]) -> Result<Self, String> {
         let data = data_dir(&layout.home);
         let bin = provision(&data)?;
@@ -155,38 +216,49 @@ impl Ludusavi {
             .map_err(|e| format!("encode ludusavi config: {e}"))?;
         let path = config_dir.join("config.yaml");
         if fs::read_to_string(&path).ok().as_deref() != Some(body.as_str()) {
-            fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+            super::fsx::atomic_write(&path, body.as_bytes())
+                .map_err(|e| format!("write {}: {e}", path.display()))?;
         }
         Ok(Self { bin, config_dir })
     }
 }
 
 impl Scanner for Ludusavi {
-    fn preview(&self, title: Option<&str>) -> Result<Preview, String> {
+    fn preview(&self, titles: &[&str]) -> Result<Preview, String> {
         let mut cmd = Command::new(&self.bin);
-        cmd.arg("--config")
-            .arg(&self.config_dir)
+        cmd.arg("--config").arg(&self.config_dir);
+        let timeout = if titles.is_empty() {
             // Offline hosts scan with the cached manifest instead of failing.
-            .arg("--try-manifest-update")
-            .args(["backup", "--preview", "--api"])
-            // With no titles ludusavi reads them from a non-tty stdin.
-            .stdin(Stdio::null());
-        if let Some(t) = title {
-            cmd.arg("--").arg(t);
+            cmd.arg("--try-manifest-update");
+            FULL_SCAN_TIMEOUT
+        } else {
+            // Per-game scans ride the manifest the last full scan refreshed.
+            cmd.arg("--no-manifest-update");
+            TITLE_SCAN_TIMEOUT
+        };
+        cmd.args(["backup", "--preview", "--api"]);
+        if !titles.is_empty() {
+            cmd.arg("--").args(titles);
         }
-        let out = cmd
-            .output()
-            .map_err(|e| format!("spawn {}: {e}", self.bin.display()))?;
+        let out = run_bounded(cmd, timeout)?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.trim().is_empty() {
+            plugin_toolkit::tracing::warn!("[game-saves] ludusavi stderr: {}", stderr.trim());
+        }
         let stdout = String::from_utf8_lossy(&out.stdout);
         // An unknown title exits 1 but still prints valid JSON.
         if stdout.trim().is_empty() {
             return Err(format!(
                 "ludusavi produced no output ({}): {}",
                 out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
+                stderr.trim()
             ));
         }
-        Preview::parse(&stdout)
+        let preview = Preview::parse(&stdout)?;
+        for w in preview.warnings() {
+            plugin_toolkit::tracing::warn!("[game-saves] {w}");
+        }
+        Ok(preview)
     }
 }
 
@@ -194,32 +266,41 @@ pub fn data_dir(home: &Path) -> PathBuf {
     home.join(".local/share/orca/raccoon/ludusavi")
 }
 
-/// A `ludusavi` on PATH, else the pinned release under `data`, downloading and
-/// verifying it on first use.
+/// The pinned ludusavi under `data`, downloading and verifying it on first
+/// use and re-verifying an existing install once per process.
 fn provision(data: &Path) -> Result<PathBuf, String> {
-    if let Some(p) = crate::checks::which("ludusavi") {
-        return Ok(p);
-    }
     let dir = data.join(VERSION);
     let bin = dir.join("ludusavi");
     if bin.is_file() {
+        if !BINARY_VERIFIED.load(Ordering::Acquire) {
+            verify_file(&bin, LINUX_X64_BIN_SHA256)?;
+            BINARY_VERIFIED.store(true, Ordering::Release);
+        }
         return Ok(bin);
     }
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return Err("no pinned ludusavi build for this platform; put `ludusavi` on PATH".into());
+        return Err("ludusavi is only provisioned for x86_64 Linux".into());
     }
     fs::create_dir_all(data).map_err(|e| format!("mkdir {}: {e}", data.display()))?;
-    let tarball = plugin_toolkit::reactor::block_on(async {
-        let resp = plugin_toolkit::reqwest::get(LINUX_X64_URL)
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| format!("download ludusavi: {e}"))?;
-        resp.bytes()
-            .await
-            .map_err(|e| format!("download ludusavi: {e}"))
-    })?;
+    let tarball =
+        plugin_toolkit::reactor::block_on(plugin_toolkit::time::timeout(DOWNLOAD_TIMEOUT, async {
+            let resp = plugin_toolkit::reqwest::get(LINUX_X64_URL)
+                .await
+                .and_then(|r| r.error_for_status())
+                .map_err(|e| format!("download ludusavi: {e}"))?;
+            resp.bytes()
+                .await
+                .map_err(|e| format!("download ludusavi: {e}"))
+        }))
+        .ok_or_else(|| {
+            format!(
+                "download ludusavi timed out after {}s",
+                DOWNLOAD_TIMEOUT.as_secs()
+            )
+        })??;
     verify(&tarball, LINUX_X64_SHA256)?;
-    install(data, &dir, &tarball)?;
+    install(data, &dir, &tarball, LINUX_X64_BIN_SHA256)?;
+    BINARY_VERIFIED.store(true, Ordering::Release);
     Ok(bin)
 }
 
@@ -228,25 +309,45 @@ fn verify(bytes: &[u8], want: &str) -> Result<(), String> {
     if got == want {
         Ok(())
     } else {
-        Err(format!("ludusavi download sha256 {got} != pinned {want}"))
+        Err(format!("ludusavi sha256 {got} != pinned {want}"))
     }
 }
 
-/// Unpack into a sibling staging dir, then rename into place, so a crash never
-/// leaves a half-extracted `dir` that later runs would trust.
-fn install(data: &Path, dir: &Path, tarball: &[u8]) -> Result<(), String> {
+fn verify_file(path: &Path, want: &str) -> Result<(), String> {
+    let got = plugin_toolkit::hash::sha256_file(path).map_err(|e| format!("{e:#}"))?;
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} sha256 {got} != pinned {want}; delete it to reinstall",
+            path.display()
+        ))
+    }
+}
+
+/// Unpack into a sibling staging dir, verify the binary, then rename into
+/// place, so a crash or a bad archive never leaves a `dir` later runs trust.
+fn install(data: &Path, dir: &Path, tarball: &[u8], bin_sha256: &str) -> Result<(), String> {
     let pid = std::process::id();
     let archive = data.join(format!(".ludusavi-{pid}.tar.gz"));
     let staging = data.join(format!(".ludusavi-{pid}"));
     let result = (|| {
         fs::write(&archive, tarball).map_err(|e| format!("write {}: {e}", archive.display()))?;
         fs::create_dir_all(&staging).map_err(|e| format!("mkdir {}: {e}", staging.display()))?;
-        let a = archive.to_string_lossy();
-        let s = staging.to_string_lossy();
-        crate::checks::run("tar", &["-xzf", &a, "-C", &s, "ludusavi"])?;
-        if !staging.join("ludusavi").is_file() {
-            return Err("ludusavi archive has no `ludusavi` binary".to_string());
+        let mut tar = Command::new("tar");
+        tar.arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&staging)
+            .arg("ludusavi");
+        let out = run_bounded(tar, TAR_TIMEOUT)?;
+        if !out.status.success() {
+            return Err(format!(
+                "tar: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
         }
+        verify_file(&staging.join("ludusavi"), bin_sha256)?;
         match fs::rename(&staging, dir) {
             Ok(()) => Ok(()),
             // A concurrent run installed it first.
@@ -254,19 +355,17 @@ fn install(data: &Path, dir: &Path, tarball: &[u8]) -> Result<(), String> {
             Err(e) => Err(format!("install {}: {e}", dir.display())),
         }
     })();
-    for leftover in [&archive, &staging] {
-        let removed = if leftover.is_dir() {
-            fs::remove_dir_all(leftover)
-        } else {
-            fs::remove_file(leftover)
-        };
-        if let Err(e) = removed
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            plugin_toolkit::tracing::warn!("[game-saves] cleanup {}: {e}", leftover.display());
-        }
-    }
+    fsx_cleanup(&archive, &staging);
     result
+}
+
+fn fsx_cleanup(archive: &Path, staging: &Path) {
+    super::fsx::remove_quietly(archive);
+    if staging.is_dir()
+        && let Err(e) = fs::remove_dir_all(staging)
+    {
+        plugin_toolkit::tracing::warn!("[game-saves] cleanup {}: {e}", staging.display());
+    }
 }
 
 #[cfg(test)]
@@ -287,7 +386,13 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(p.files("Hades"), vec![PathBuf::from("/h/a.sav")]);
+        assert_eq!(
+            p.files("Hades"),
+            vec![ScanFile {
+                path: PathBuf::from("/h/a.sav"),
+                duplicated_by: Vec::new()
+            }]
+        );
         assert!(p.files("Nope").is_empty());
 
         let unknown = Preview::parse(
@@ -340,7 +445,6 @@ mod tests {
             vec![
                 ("steam".into(), ".local/share/Steam".into()),
                 ("heroic".into(), ".config/heroic".into()),
-                ("otherWine".into(), "Games/Heroic/Prefixes/default".into()),
                 ("otherWine".into(), "Games/battlenet".into()),
             ]
         );
@@ -355,10 +459,66 @@ mod tests {
     }
 
     #[test]
+    fn surfaces_ludusavi_failures() {
+        let p = Preview::parse(
+            r#"{"errors": {"someGamesFailed": true}, "games": {"G": {"decision": "Processed",
+                "change": "New", "files": {"/x": {"change": "New", "bytes": 1, "failed": true,
+                "error": {"message": "permission denied"}}}, "registry": {}}}}"#,
+        )
+        .unwrap();
+        assert!(p.files("G").is_empty());
+        assert_eq!(
+            p.warnings(),
+            vec![
+                "ludusavi: some games failed".to_string(),
+                "ludusavi: G: /x: permission denied".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn install_unpacks_verifies_and_is_idempotent() {
+        let t = TempDir::new();
+        let src = t.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("ludusavi"), b"#!/bin/sh\necho fake\n").unwrap();
+        let tgz = t.path().join("l.tar.gz");
+        let out = Command::new("tar")
+            .arg("-czf")
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&src)
+            .arg("ludusavi")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let bytes = fs::read(&tgz).unwrap();
+        let bin_sha = plugin_toolkit::hash::sha256_hex(b"#!/bin/sh\necho fake\n");
+        let data = t.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+
+        let dir = data.join("bad");
+        assert!(install(&data, &dir, &bytes, &"0".repeat(64)).is_err());
+        assert!(!dir.exists());
+
+        let dir = data.join(VERSION);
+        install(&data, &dir, &bytes, &bin_sha).unwrap();
+        assert!(dir.join("ludusavi").is_file());
+        install(&data, &dir, &bytes, &bin_sha).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(&data)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, vec![VERSION.to_string()]);
+    }
+
+    #[test]
     fn verify_rejects_a_mismatched_download() {
         assert!(verify(b"abc", &plugin_toolkit::hash::sha256_hex(b"abc")).is_ok());
         assert!(verify(b"abd", &plugin_toolkit::hash::sha256_hex(b"abc")).is_err());
         assert_eq!(LINUX_X64_SHA256.len(), 64);
+        assert_eq!(LINUX_X64_BIN_SHA256.len(), 64);
         assert!(LINUX_X64_URL.contains(VERSION));
     }
 }

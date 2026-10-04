@@ -5,8 +5,8 @@
 //! <payload>/manifest.json
 //! <payload>/files/<part>/<relpath>
 //! ```
-//! The manifest's `mtime_ns` is authoritative: a payload on SMB/NFS may round
-//! file times, and newest-wins comparisons must use the source's exact mtime.
+//! Payload files carry no meaningful mtime or mode; the manifest's
+//! `mtime_ns` (the source file's exact mtime) is what restore stamps back.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use plugin_toolkit::serde_json;
 use serde::{Deserialize, Serialize};
 
-use super::select::SourceFile;
+use super::fsx;
 
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const FILES_DIR: &str = "files";
@@ -52,7 +52,7 @@ pub struct FileEntry {
 pub struct CaptureStats {
     pub files: usize,
     pub bytes: u64,
-    /// Source files that vanished or went unreadable mid-capture.
+    /// Local files that vanished between scan and copy.
     pub skipped: Vec<String>,
 }
 
@@ -80,10 +80,37 @@ impl Manifest {
     }
 }
 
-/// Copy `files` into `payload_dir` (mtimes preserved) and write the manifest.
-/// Returns the manifest, its sha256, and capture stats.
+/// Where a planned file's bytes come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// A live local save.
+    Local,
+    /// A blob this host keeps for the pool (a part it can't place locally).
+    Blob,
+}
+
+/// One file of the payload to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedFile {
+    pub part: String,
+    /// `/`-separated.
+    pub rel: String,
+    pub src: PathBuf,
+    pub origin: Origin,
+    /// The entry to record when the bytes are already known (a blob, or a
+    /// local file identical to the latest); the copy must hash to it.
+    pub expect: Option<FileEntry>,
+}
+
+/// A local file rewritten mid-copy is retried this many times before the
+/// backup gives up rather than publish a torn save.
+const TORN_RETRIES: usize = 3;
+
+/// Copy `plan` into `payload_dir` and write the manifest. Returns the
+/// manifest, its sha256, and capture stats. Only a local source that no longer
+/// exists is skipped; any other failure aborts, and so does capturing nothing.
 pub fn capture(
-    files: &[SourceFile],
+    plan: &[PlannedFile],
     payload_dir: &Path,
     instance: &str,
     title: &str,
@@ -91,28 +118,44 @@ pub fn capture(
 ) -> Result<(Manifest, String, CaptureStats), String> {
     let mut stats = CaptureStats::default();
     let mut out: BTreeMap<String, Vec<FileEntry>> = BTreeMap::new();
-    for f in files {
-        let dst = payload_dir.join(FILES_DIR).join(f.part).join(&f.rel);
-        match copy_with_mtime(&f.abs, &dst) {
-            Ok(entry_mtime) => {
-                let size = fs::metadata(&dst)
-                    .map_err(|e| format!("stat {}: {e}", dst.display()))?
-                    .len();
-                let sha256 = plugin_toolkit::hash::sha256_file(&dst)
-                    .map_err(|e| format!("hash {}: {e:#}", dst.display()))?;
-                stats.files += 1;
-                stats.bytes += size;
-                out.entry(f.part.to_string()).or_default().push(FileEntry {
-                    relpath: slash_path(&f.rel),
-                    size,
-                    mtime_ns: entry_mtime,
-                    sha256,
-                });
-            }
-            // A save vanishing between scan and copy is a skip, not a failed
-            // backup.
-            Err(e) => stats.skipped.push(e),
+    for f in plan {
+        let dst = payload_dir
+            .join(FILES_DIR)
+            .join(checked_rel(&f.part)?)
+            .join(checked_rel(&f.rel)?);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
+        let entry = match f.origin {
+            Origin::Blob => {
+                let want = f
+                    .expect
+                    .clone()
+                    .ok_or_else(|| format!("blob {} has no manifest entry", f.src.display()))?;
+                let (_, sha) = fsx::copy_hashing(&f.src, &dst)
+                    .map_err(|e| format!("copy {}: {e}", f.src.display()))?;
+                if sha != want.sha256 {
+                    return Err(format!("{}: blob sha256 {sha} != {}", f.rel, want.sha256));
+                }
+                want
+            }
+            Origin::Local => match copy_local(&f.src, &dst, f.expect.as_ref())? {
+                Some(e) => FileEntry {
+                    relpath: f.rel.clone(),
+                    ..e
+                },
+                None => {
+                    stats.skipped.push(format!("{}: vanished", f.src.display()));
+                    continue;
+                }
+            },
+        };
+        stats.files += 1;
+        stats.bytes += entry.size;
+        out.entry(f.part.clone()).or_default().push(entry);
+    }
+    if stats.files == 0 {
+        return Err("no save files captured".to_string());
     }
     for entries in out.values_mut() {
         entries.sort_by(|a, b| a.relpath.cmp(&b.relpath));
@@ -129,18 +172,50 @@ pub fn capture(
     Ok((manifest, checksum, stats))
 }
 
-/// Copy `src` → `dst` (creating parents) and stamp `dst` with `src`'s mtime.
-/// Returns that mtime in ns.
-fn copy_with_mtime(src: &Path, dst: &Path) -> Result<i64, String> {
-    let mtime = fs::metadata(src)
-        .and_then(|m| m.modified())
-        .map_err(|e| format!("stat {}: {e}", src.display()))?;
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+/// Copy a live save, retrying if it changes underneath (size or mtime differ
+/// before vs after). `None` when the source no longer exists.
+fn copy_local(
+    src: &Path,
+    dst: &Path,
+    expect: Option<&FileEntry>,
+) -> Result<Option<FileEntry>, String> {
+    for _ in 0..TORN_RETRIES {
+        let before = match fs::metadata(src) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("stat {}: {e}", src.display())),
+        };
+        let (size, sha256) = match fsx::copy_hashing(src, dst) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !src.exists() => {
+                fsx::remove_quietly(dst);
+                return Ok(None);
+            }
+            Err(e) => return Err(format!("copy {} -> {}: {e}", src.display(), dst.display())),
+        };
+        let after = fs::metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
+        let mtime = before
+            .modified()
+            .map(to_ns)
+            .map_err(|e| format!("stat {}: {e}", src.display()))?;
+        let stable = before.len() == after.len() && after.modified().ok().map(to_ns) == Some(mtime);
+        if stable && size == before.len() {
+            return Ok(Some(match expect {
+                Some(e) if e.sha256 == sha256 => e.clone(),
+                _ => FileEntry {
+                    relpath: String::new(),
+                    size,
+                    mtime_ns: mtime,
+                    sha256,
+                },
+            }));
+        }
+        fsx::remove_quietly(dst);
     }
-    fs::copy(src, dst).map_err(|e| format!("copy {}: {e}", src.display()))?;
-    set_mtime(dst, mtime)?;
-    Ok(to_ns(mtime))
+    Err(format!(
+        "{} kept changing during backup; is the game running?",
+        src.display()
+    ))
 }
 
 pub fn set_mtime(path: &Path, t: SystemTime) -> Result<(), String> {
@@ -179,7 +254,7 @@ pub fn checked_rel(rel: &str) -> Result<PathBuf, String> {
     Ok(p.to_path_buf())
 }
 
-fn slash_path(p: &Path) -> String {
+pub fn slash_path(p: &Path) -> String {
     p.components()
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
@@ -192,7 +267,7 @@ mod tests {
     use crate::saves::testutil::{TempDir, set_mtime_secs, write};
 
     #[test]
-    fn capture_copies_preserves_mtime_and_describes_files() {
+    fn capture_records_source_mtime_and_hash() {
         let t = TempDir::new();
         let root = t.path().join("prefix/drive_c/users/steamuser");
         let save = root.join("AppData/Roaming/G/save.dat");
@@ -201,12 +276,14 @@ mod tests {
         let payload = t.path().join("payload");
         fs::create_dir_all(&payload).unwrap();
 
-        let files = vec![SourceFile {
-            part: "wine-user",
-            rel: PathBuf::from("AppData/Roaming/G/save.dat"),
-            abs: save,
+        let plan = vec![PlannedFile {
+            part: "wine-user".into(),
+            rel: "AppData/Roaming/G/save.dat".into(),
+            src: save,
+            origin: Origin::Local,
+            expect: None,
         }];
-        let (m, sum, stats) = capture(&files, &payload, "hades", "Hades", "bragi").unwrap();
+        let (m, sum, stats) = capture(&plan, &payload, "hades", "Hades", "bragi").unwrap();
 
         assert_eq!((stats.files, stats.bytes), (1, 5));
         assert_eq!(
@@ -221,11 +298,57 @@ mod tests {
 
         let copied = payload.join("files/wine-user/AppData/Roaming/G/save.dat");
         assert_eq!(fs::read_to_string(&copied).unwrap(), "hello");
-        assert_eq!(mtime_ns(&copied).unwrap(), e.mtime_ns);
 
         let raw = fs::read(payload.join(MANIFEST_FILE)).unwrap();
         assert_eq!(sum, plugin_toolkit::hash::sha256_hex(&raw));
         assert_eq!(Manifest::read(&payload).unwrap(), m);
+    }
+
+    #[test]
+    fn capture_errors_only_skip_vanished_sources() {
+        let t = TempDir::new();
+        let payload = t.path().join("payload");
+        fs::create_dir_all(&payload).unwrap();
+        let src = t.path().join("a.sav");
+        write(&src, "a");
+        let plan = |src: PathBuf, origin, expect| PlannedFile {
+            part: "home".into(),
+            rel: "a.sav".into(),
+            src,
+            origin,
+            expect,
+        };
+        // Vanished local → skip; nothing left → error.
+        let gone = plan(t.path().join("gone.sav"), Origin::Local, None);
+        let e = capture(std::slice::from_ref(&gone), &payload, "g", "G", "h").unwrap_err();
+        assert!(e.contains("no save files"), "{e}");
+        let (_, _, stats) = capture(
+            &[gone, plan(src.clone(), Origin::Local, None)],
+            &t.path().join("p2"),
+            "g",
+            "G",
+            "h",
+        )
+        .unwrap();
+        assert_eq!((stats.files, stats.skipped.len()), (1, 1));
+
+        // A missing or wrong blob is never skipped.
+        let entry = FileEntry {
+            relpath: "a.sav".into(),
+            size: 1,
+            mtime_ns: 0,
+            sha256: plugin_toolkit::hash::sha256_hex(b"other"),
+        };
+        let missing = plan(t.path().join("blob"), Origin::Blob, Some(entry.clone()));
+        assert!(capture(&[missing], &t.path().join("p3"), "g", "G", "h").is_err());
+        let wrong = plan(src.clone(), Origin::Blob, Some(entry));
+        assert!(capture(&[wrong], &t.path().join("p4"), "g", "G", "h").is_err());
+
+        // Destination failures propagate: the payload path is a file.
+        let blocked = t.path().join("p5");
+        write(&blocked.join("files"), "not a dir");
+        let e = capture(&[plan(src, Origin::Local, None)], &blocked, "g", "G", "h").unwrap_err();
+        assert!(e.contains("mkdir"), "{e}");
     }
 
     #[test]

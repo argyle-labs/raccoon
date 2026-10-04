@@ -1399,24 +1399,17 @@ fn tuned_active() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Read orca's `power:cpu` config row's `mode` field via the `orca` CLI. Returns
-/// `None` if orca isn't present or the row/field is absent.
+/// Read orca's `power:cpu` config row's `mode` field. Returns `None` if the
+/// row/field is absent or unreadable (the latter is logged).
 fn orca_power_cpu_mode() -> Option<String> {
-    #[derive(Deserialize)]
-    struct Row {
-        json: String,
-    }
-    #[derive(Deserialize)]
-    struct Get {
-        row: Row,
-    }
     #[derive(Deserialize)]
     struct Cpu {
         mode: String,
     }
-    let out = run_ok("orca", &["config", "get", "power", "cpu"])?;
-    let get: Get = serde_json::from_str(&out).ok()?;
-    let cpu: Cpu = serde_json::from_str(&get.row.json).ok()?;
+    let json = crate::config::row_json("power", "cpu")
+        .inspect_err(|e| plugin_toolkit::tracing::warn!("[raccoon] {e}"))
+        .ok()??;
+    let cpu: Cpu = serde_json::from_str(&json).ok()?;
     Some(cpu.mode)
 }
 
@@ -1470,7 +1463,7 @@ pub(crate) fn which(bin: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Run a command, returning combined stdout on success or an error string.
+/// Run a command, returning its stdout on success or the first stderr line.
 pub(crate) fn run(bin: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new(bin)
         .args(args)

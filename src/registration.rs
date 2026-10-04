@@ -26,7 +26,7 @@ const BACKUP_PREFIX: &str = "raccoon.__backup_game_saves";
 
 /// The `backup_kind` backend def for `game-saves`.
 pub fn backup_backend_def() -> BackendDef {
-    backup_kind_backend_def(KIND, BACKUP_PREFIX)
+    crate::compat::syncable(backup_kind_backend_def(KIND, BACKUP_PREFIX))
 }
 
 /// Escape-hatch dispatcher for `raccoon.__backup_game_saves.*`. Returns `None`
