@@ -328,12 +328,20 @@ fn verify_file(path: &Path, want: &str) -> Result<(), String> {
 /// Unpack into a sibling staging dir, verify the binary, then rename into
 /// place, so a crash or a bad archive never leaves a `dir` later runs trust.
 fn install(data: &Path, dir: &Path, tarball: &[u8], bin_sha256: &str) -> Result<(), String> {
-    let pid = std::process::id();
-    let archive = data.join(format!(".ludusavi-{pid}.tar.gz"));
-    let staging = data.join(format!(".ludusavi-{pid}"));
+    use std::io::Write;
+    let (archive, mut f) = super::fsx::create_temp(data, ".ludusavi-", super::fsx::NEW_FILE_MODE)
+        .map_err(|e| format!("write archive in {}: {e}", data.display()))?;
+    let written = f
+        .write_all(tarball)
+        .map_err(|e| format!("write {}: {e}", archive.display()));
+    drop(f);
+    let staging = data.join(format!(".ludusavi-{}", plugin_toolkit::mint_uuidv7()));
+    let mut staging_made = false;
     let result = (|| {
-        fs::write(&archive, tarball).map_err(|e| format!("write {}: {e}", archive.display()))?;
-        fs::create_dir_all(&staging).map_err(|e| format!("mkdir {}: {e}", staging.display()))?;
+        written?;
+        // Not `create_dir_all`: an existing dir (or symlink) there is not ours.
+        fs::create_dir(&staging).map_err(|e| format!("mkdir {}: {e}", staging.display()))?;
+        staging_made = true;
         let mut tar = Command::new("tar");
         tar.arg("-xzf")
             .arg(&archive)
@@ -355,13 +363,14 @@ fn install(data: &Path, dir: &Path, tarball: &[u8], bin_sha256: &str) -> Result<
             Err(e) => Err(format!("install {}: {e}", dir.display())),
         }
     })();
-    fsx_cleanup(&archive, &staging);
+    fsx_cleanup(&archive, staging_made.then_some(staging.as_path()));
     result
 }
 
-fn fsx_cleanup(archive: &Path, staging: &Path) {
+fn fsx_cleanup(archive: &Path, staging: Option<&Path>) {
     super::fsx::remove_quietly(archive);
-    if staging.is_dir()
+    if let Some(staging) = staging
+        && staging.is_dir()
         && let Err(e) = fs::remove_dir_all(staging)
     {
         plugin_toolkit::tracing::warn!("[game-saves] cleanup {}: {e}", staging.display());

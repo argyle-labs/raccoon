@@ -13,14 +13,36 @@ const IN_MEMORY_MAX: u64 = 256 * 1024 * 1024;
 /// source's mode bits are never carried over) and fsync it. Returns
 /// `(size, sha256)` of the bytes written.
 pub fn copy_hashing(src: &Path, dst: &Path) -> io::Result<(u64, String)> {
+    let mut out = open_new(dst, DEFAULT_FILE_MODE)?;
+    copy_into(src, &mut out, dst)
+}
+
+/// [`copy_hashing`] into a fresh [`create_temp`] named `{prefix}<random>` in
+/// `dir`, removed again if the copy fails. Returns `(temp, size, sha256)`.
+pub fn copy_hashing_to_temp(
+    src: &Path,
+    dir: &Path,
+    prefix: &str,
+) -> io::Result<(PathBuf, u64, String)> {
+    let (tmp, mut out) = create_temp(dir, prefix, DEFAULT_FILE_MODE)?;
+    match copy_into(src, &mut out, &tmp) {
+        Ok((n, sha)) => Ok((tmp, n, sha)),
+        Err(e) => {
+            drop(out);
+            remove_quietly(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn copy_into(src: &Path, out: &mut File, dst: &Path) -> io::Result<(u64, String)> {
     let len = fs::metadata(src)?.len();
-    let mut out = OpenOptions::new().write(true).create_new(true).open(dst)?;
     let result = if len <= IN_MEMORY_MAX {
         let bytes = fs::read(src)?;
         out.write_all(&bytes)?;
         Ok((bytes.len() as u64, plugin_toolkit::hash::sha256_hex(&bytes)))
     } else {
-        let n = io::copy(&mut File::open(src)?, &mut out)?;
+        let n = io::copy(&mut File::open(src)?, out)?;
         plugin_toolkit::hash::sha256_file(dst)
             .map(|sha| (n, sha))
             .map_err(|e| io::Error::other(format!("{e:#}")))
@@ -30,7 +52,10 @@ pub fn copy_hashing(src: &Path, dst: &Path) -> io::Result<(u64, String)> {
 }
 
 /// Mode of a file [`atomic_write`] creates; a replaced regular file keeps its own.
-const NEW_FILE_MODE: u32 = 0o600;
+pub const NEW_FILE_MODE: u32 = 0o600;
+
+/// What `File::create` asks for; the umask then applies.
+const DEFAULT_FILE_MODE: u32 = 0o666;
 
 /// Write `bytes` to `path` via a fsynced sibling temp + rename + dir fsync, so
 /// a crash leaves either the old file or the new one. The temp is created
@@ -46,7 +71,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         _ => NEW_FILE_MODE,
     };
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let (tmp, mut f) = create_temp(dir, &name, mode)?;
+    let (tmp, mut f) = create_temp(dir, &format!(".{name}.tmp-"), mode)?;
     let written = (|| {
         f.write_all(bytes)?;
         // The create mode is filtered by the umask; set it exactly.
@@ -62,12 +87,12 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     written
 }
 
-/// A fresh `.{name}.tmp-<random>` in `dir`, opened `O_EXCL | O_NOFOLLOW`.
-fn create_temp(dir: &Path, name: &str, mode: u32) -> io::Result<(PathBuf, File)> {
+/// A fresh `{prefix}<random>` in `dir`, opened `O_EXCL | O_NOFOLLOW`.
+pub fn create_temp(dir: &Path, prefix: &str, mode: u32) -> io::Result<(PathBuf, File)> {
     const ATTEMPTS: usize = 8;
     let mut last = None;
     for _ in 0..ATTEMPTS {
-        let tmp = dir.join(format!(".{name}.tmp-{}", plugin_toolkit::mint_uuidv7()));
+        let tmp = dir.join(format!("{prefix}{}", plugin_toolkit::mint_uuidv7()));
         match open_new(&tmp, mode) {
             Ok(f) => return Ok((tmp, f)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
@@ -78,7 +103,7 @@ fn create_temp(dir: &Path, name: &str, mode: u32) -> io::Result<(PathBuf, File)>
 }
 
 /// Create `path`, failing if anything (a symlink included) is already there.
-fn open_new(path: &Path, mode: u32) -> io::Result<File> {
+pub fn open_new(path: &Path, mode: u32) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -94,7 +119,7 @@ fn open_new(path: &Path, mode: u32) -> io::Result<File> {
 #[cfg(unix)]
 fn permission_bits(meta: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o7777
+    meta.permissions().mode() & 0o777
 }
 
 #[cfg(not(unix))]
@@ -111,6 +136,18 @@ fn set_mode(f: &File, mode: u32) -> io::Result<()> {
 #[cfg(not(unix))]
 fn set_mode(_: &File, _: u32) -> io::Result<()> {
     Ok(())
+}
+
+/// Give `to` the permission bits (setuid/setgid/sticky dropped) of `from`
+/// when `from` is a regular file; a symlink there is not followed.
+pub fn keep_mode(from: &Path, to: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(from) {
+        Ok(m) if m.is_file() => set_mode(
+            &OpenOptions::new().read(true).open(to)?,
+            permission_bits(&m),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Read `path`, which must be a regular file of at most `cap` bytes. On unix a
@@ -236,6 +273,9 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &link).unwrap();
         atomic_write(&link, b"x").unwrap();
         assert!(fs::symlink_metadata(&link).unwrap().is_file());
+        use std::os::unix::fs::PermissionsExt;
+        let link_mode = fs::metadata(&link).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(link_mode, NEW_FILE_MODE);
         assert_eq!(fs::read(&victim).unwrap(), b"precious");
     }
 
@@ -248,14 +288,44 @@ mod tests {
         let fresh = t.path().join("fresh");
         atomic_write(&fresh, b"1").unwrap();
         assert_eq!(mode(&fresh), NEW_FILE_MODE);
-        for kept in [0o640, 0o444, 0o755] {
+        for kept in [0o640, 0o444, 0o755, 0o4755] {
             let p = t.path().join(format!("kept-{kept:o}"));
             write(&p, "old");
             fs::set_permissions(&p, fs::Permissions::from_mode(kept)).unwrap();
             atomic_write(&p, b"new").unwrap();
-            assert_eq!(mode(&p), kept);
+            assert_eq!(mode(&p), kept & 0o777);
             assert_eq!(fs::read(&p).unwrap(), b"new");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keep_mode_drops_special_bits_and_ignores_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let t = TempDir::new();
+        let suid = t.path().join("suid");
+        write(&suid, "x");
+        fs::set_permissions(&suid, fs::Permissions::from_mode(0o4750)).unwrap();
+        let (tmp, _, _) = copy_hashing_to_temp(&suid, t.path(), ".t-").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).unwrap();
+        keep_mode(&suid, &tmp).unwrap();
+        assert_eq!(mode(&tmp), 0o750);
+
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&suid, &link).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).unwrap();
+        keep_mode(&link, &tmp).unwrap();
+        assert_eq!(mode(&tmp), 0o600);
+    }
+
+    #[test]
+    fn copy_hashing_to_temp_leaves_nothing_on_failure() {
+        let t = TempDir::new();
+        let d = t.path().join("d");
+        fs::create_dir_all(&d).unwrap();
+        assert!(copy_hashing_to_temp(&t.path().join("absent"), &d, ".x-").is_err());
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 0);
     }
 
     #[test]
