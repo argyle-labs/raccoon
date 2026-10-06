@@ -966,7 +966,7 @@ fn repair_alsa_headroom() -> (bool, String) {
     {
         return (false, format!("create {}: {e}", dir.display()));
     }
-    if let Err(e) = fs::write(&dst, HEADROOM_CONF) {
+    if let Err(e) = crate::saves::fsx::atomic_write(&dst, HEADROOM_CONF.as_bytes()) {
         return (false, format!("write {}: {e}", dst.display()));
     }
     match run("systemctl", &["--user", "restart", "wireplumber"]) {
@@ -1025,6 +1025,7 @@ fn repair_gpu_perf() -> (bool, String) {
     let mut wrote = 0;
     let mut last_err = String::new();
     for p in &paths {
+        // sysfs attributes must be written in place; there is no file to replace.
         match fs::write(p, "auto") {
             Ok(_) => wrote += 1,
             Err(e) => last_err = format!("{}: {e}", p.display()),
@@ -1081,6 +1082,7 @@ fn repair_suspend_wakeup() -> (bool, String) {
     let (mut live_ok, mut live_total) = (0usize, 0usize);
     for path in &live_targets {
         live_total += 1;
+        // sysfs attributes must be written in place; there is no file to replace.
         if fs::write(path, "disabled").is_ok() {
             live_ok += 1;
         } else {
@@ -1094,6 +1096,7 @@ fn repair_suspend_wakeup() -> (bool, String) {
     }
 
     // 3. Persist the udev rules (controllers always; radios by id when present).
+    // Root-only /etc/udev/rules.d: no unprivileged writer can plant a symlink there.
     if fs::write(CONTROLLER_RULE_PATH, CONTROLLER_RULE_BODY).is_ok() {
         done.push(format!("wrote {CONTROLLER_RULE_PATH}"));
     } else {
@@ -1112,6 +1115,7 @@ fn repair_suspend_wakeup() -> (bool, String) {
                 )
             })
             .collect();
+        // Root-only /etc/udev/rules.d: no unprivileged writer can plant a symlink there.
         if fs::write(WAKEUP_RULE_PATH, &rule).is_ok() {
             done.push(format!("wrote {WAKEUP_RULE_PATH}"));
         } else {

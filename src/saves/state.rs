@@ -110,25 +110,19 @@ impl Store {
         }
         let dir = dst.parent().unwrap_or(&self.root);
         fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-        let tmp = dir.join(format!(".{sha256}.tmp-{}", std::process::id()));
-        fsx::remove_quietly(&tmp);
-        let copied =
-            fsx::copy_hashing(src, &tmp).map_err(|e| format!("cache {}: {e}", src.display()));
-        match copied {
-            Ok((_, got)) if got == sha256 => {
-                fs::rename(&tmp, &dst).map_err(|e| format!("cache {}: {e}", dst.display()))
-            }
-            Ok((_, got)) => {
+        let (tmp, _, got) = fsx::copy_hashing_to_temp(src, dir, &format!(".{sha256}.tmp-"))
+            .map_err(|e| format!("cache {}: {e}", src.display()))?;
+        if got == sha256 {
+            fs::rename(&tmp, &dst).map_err(|e| {
                 fsx::remove_quietly(&tmp);
-                Err(format!(
-                    "{}: sha256 {got} != manifest {sha256}",
-                    src.display()
-                ))
-            }
-            Err(e) => {
-                fsx::remove_quietly(&tmp);
-                Err(e)
-            }
+                format!("cache {}: {e}", dst.display())
+            })
+        } else {
+            fsx::remove_quietly(&tmp);
+            Err(format!(
+                "{}: sha256 {got} != manifest {sha256}",
+                src.display()
+            ))
         }
     }
 

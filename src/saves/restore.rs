@@ -156,7 +156,7 @@ fn restore_part(
     let conflicted = items.iter().any(|i| i.action == Action::Conflict);
 
     let mut existing_conflicts = Vec::new();
-    for (n, item) in items.iter_mut().enumerate() {
+    for item in items.iter_mut() {
         if !matches!(
             item.action,
             Action::Write | Action::FastForward | Action::Conflict
@@ -167,7 +167,7 @@ fn restore_part(
             existing_conflicts.push((c, item.src.clone(), item.entry.sha256.clone()));
             continue;
         }
-        match stage(item, n) {
+        match stage(item) {
             Ok(tmp) => item.staged = Some(tmp),
             Err(e) => {
                 report.errors.push(format!(
@@ -299,23 +299,22 @@ fn plan<'a>(
 }
 
 /// Copy the payload file next to its destination, verify it, stamp its mtime.
-fn stage(item: &Item, n: usize) -> Result<PathBuf, String> {
+fn stage(item: &Item) -> Result<PathBuf, String> {
     let parent = item
         .dst
         .parent()
         .ok_or_else(|| format!("no parent for {}", item.dst.display()))?;
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     let name = item.dst.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = parent.join(format!(".{name}.orca-restore-{}-{n}", std::process::id()));
-    fsx::remove_quietly(&tmp);
-    let staged = (|| {
-        let (_, sha) = fsx::copy_hashing(&item.src, &tmp)
+    // The `.orca-restore-` infix is what capture skips as a restore artifact.
+    let (tmp, _, sha) =
+        fsx::copy_hashing_to_temp(&item.src, parent, &format!(".{name}.orca-restore-"))
             .map_err(|e| format!("copy {}: {e}", item.src.display()))?;
-        if sha != item.entry.sha256 {
-            return Err("payload copy does not match its manifest checksum".to_string());
-        }
+    let staged = if sha == item.entry.sha256 {
         manifest::set_mtime(&tmp, manifest::from_ns(item.entry.mtime_ns))
-    })();
+    } else {
+        Err("payload copy does not match its manifest checksum".to_string())
+    };
     match staged {
         Ok(()) => Ok(tmp),
         Err(e) => {
@@ -340,9 +339,7 @@ fn apply(
     report: &mut RestoreReport,
 ) -> Result<(), String> {
     if action == Action::FastForward {
-        if let Ok(old) = fs::metadata(&item.dst)
-            && let Err(e) = fs::set_permissions(tmp, old.permissions())
-        {
+        if let Err(e) = fsx::keep_mode(&item.dst, tmp) {
             plugin_toolkit::tracing::warn!("[game-saves] keep mode of {}: {e}", item.dst.display());
         }
         let aside = sibling_path(&item.dst, "replaced", stamp);

@@ -78,7 +78,7 @@ impl Manifest {
     pub fn write(&self, payload_dir: &Path) -> Result<String, String> {
         let raw = serde_json::to_vec_pretty(self).map_err(|e| format!("encode manifest: {e}"))?;
         let path = payload_dir.join(MANIFEST_FILE);
-        fs::write(&path, &raw).map_err(|e| format!("write {}: {e}", path.display()))?;
+        fsx::atomic_write(&path, &raw).map_err(|e| format!("write {}: {e}", path.display()))?;
         Ok(plugin_toolkit::hash::sha256_hex(&raw))
     }
 }
