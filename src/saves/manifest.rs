@@ -248,10 +248,15 @@ pub fn from_ns(ns: i64) -> SystemTime {
 
 /// `rel` as a path of only normal components — game keys and relpaths come
 /// from a payload that may have been produced on another host, so a `..` or
-/// absolute path must never let a restore write outside its root.
+/// absolute path must never let a restore write outside its root. Segments are
+/// checked on the raw string because `Path::components` silently drops empty
+/// and `.` segments, and a NUL would truncate the path at the syscall.
 pub fn checked_rel(rel: &str) -> Result<PathBuf, String> {
     let p = Path::new(rel);
-    if rel.is_empty() || !p.components().all(|c| matches!(c, Component::Normal(_))) {
+    let segments_ok = rel
+        .split('/')
+        .all(|s| !s.is_empty() && s != "." && s != ".." && !s.contains('\0'));
+    if !segments_ok || !p.components().all(|c| matches!(c, Component::Normal(_))) {
         return Err(format!("unsafe relative path in manifest: {rel:?}"));
     }
     Ok(p.to_path_buf())
@@ -361,6 +366,9 @@ mod tests {
         assert!(checked_rel("/etc/passwd").is_err());
         assert!(checked_rel("a/../../b").is_err());
         assert!(checked_rel("").is_err());
+        for bad in ["a//b", "a/", "/a", "a/./b", "./a", "a/\0b", "a\0"] {
+            assert!(checked_rel(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
