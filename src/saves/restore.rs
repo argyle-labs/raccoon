@@ -186,7 +186,13 @@ fn restore_part(
     }
     for item in &items {
         let k = key(part, &item.entry.relpath);
-        let result = match (item.action, &item.staged) {
+        // Re-resolved at commit: staging can take long enough for a checked
+        // dir to be swapped for a symlink out of the anchor.
+        let recheck = match &item.staged {
+            Some(_) => guard::stays_inside(anchor, &item.dst),
+            None => Ok(()),
+        };
+        let result = recheck.and_then(|()| match (item.action, &item.staged) {
             (Action::Unchanged, _) => {
                 let (size, mtime_ns) = item
                     .local_stat
@@ -228,7 +234,7 @@ fn restore_part(
                     },
                 ))
             }),
-        };
+        });
         if let Err(e) = result {
             report
                 .errors

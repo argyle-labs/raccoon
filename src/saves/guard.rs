@@ -115,6 +115,14 @@ pub fn mtime_plausible(mtime_ns: i64) -> Result<(), String> {
 
 /// `dst` resolves inside `anchor` even through symlinks: its nearest existing
 /// ancestor, canonicalized, must lie under the canonical anchor.
+///
+/// This is a check, not a capability: the caller writes by path afterwards,
+/// so a process that can write under `anchor` (i.e. runs as this user) can
+/// swap a checked directory for a symlink between the check and the write and
+/// carry it elsewhere. Restore re-runs it immediately before each rename,
+/// leaving only that syscall-sized window; the staged temp itself is created
+/// `O_EXCL` and cannot be redirected by a symlink at its own name. Closing the
+/// window entirely needs an `openat` walk with `O_NOFOLLOW` per component.
 pub fn stays_inside(anchor: &Path, dst: &Path) -> Result<(), String> {
     // An anchor not created yet resolves through its nearest existing
     // ancestor; nothing below that exists to redirect a write.
