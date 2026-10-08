@@ -216,7 +216,7 @@ impl Ludusavi {
             .map_err(|e| format!("encode ludusavi config: {e}"))?;
         let path = config_dir.join("config.yaml");
         if fs::read_to_string(&path).ok().as_deref() != Some(body.as_str()) {
-            super::fsx::atomic_write(&path, body.as_bytes())
+            super::fsx::atomic_write(&path, body.as_bytes(), super::fsx::NewMode::Private)
                 .map_err(|e| format!("write {}: {e}", path.display()))?;
         }
         Ok(Self { bin, config_dir })

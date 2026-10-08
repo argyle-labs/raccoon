@@ -155,7 +155,8 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, S
 fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<(), String> {
     let raw =
         serde_json::to_vec_pretty(v).map_err(|e| format!("encode {}: {e}", path.display()))?;
-    fsx::atomic_write(path, &raw).map_err(|e| format!("write {}: {e}", path.display()))
+    fsx::atomic_write(path, &raw, fsx::NewMode::Private)
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 #[cfg(test)]
