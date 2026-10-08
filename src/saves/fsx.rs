@@ -51,8 +51,17 @@ fn copy_into(src: &Path, out: &mut File, dst: &Path) -> io::Result<(u64, String)
     result
 }
 
-/// Mode of a file [`atomic_write`] creates; a replaced regular file keeps its own.
+/// Mode of a file [`atomic_write`] creates with [`NewMode::Private`].
 pub const NEW_FILE_MODE: u32 = 0o600;
+
+/// The mode [`atomic_write`] gives a file it creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewMode {
+    /// [`NEW_FILE_MODE`], whatever the umask: this host's own state.
+    Private,
+    /// `0o666` less the umask, like `File::create`: files another host reads.
+    Umask,
+}
 
 /// What `File::create` asks for; the umask then applies.
 const DEFAULT_FILE_MODE: u32 = 0o666;
@@ -61,21 +70,26 @@ const DEFAULT_FILE_MODE: u32 = 0o666;
 /// a crash leaves either the old file or the new one. The temp is created
 /// exclusively under a random name and never through a symlink, so nothing
 /// planted beside `path` can redirect the write.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub fn atomic_write(path: &Path, bytes: &[u8], new: NewMode) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("path has no parent"))?;
     fs::create_dir_all(dir)?;
-    let mode = match fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() => permission_bits(&m),
-        _ => NEW_FILE_MODE,
+    // `None`: leave the umask-filtered create mode as is.
+    let exact = match fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => Some(permission_bits(&m)),
+        _ if new == NewMode::Private => Some(NEW_FILE_MODE),
+        _ => None,
     };
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let (tmp, mut f) = create_temp(dir, &format!(".{name}.tmp-"), mode)?;
+    let create_mode = exact.unwrap_or(DEFAULT_FILE_MODE);
+    let (tmp, mut f) = create_temp(dir, &format!(".{name}.tmp-"), create_mode)?;
     let written = (|| {
         f.write_all(bytes)?;
         // The create mode is filtered by the umask; set it exactly.
-        set_mode(&f, mode)?;
+        if let Some(mode) = exact {
+            set_mode(&f, mode)?;
+        }
         f.sync_all()?;
         drop(f);
         fs::rename(&tmp, path)?;
@@ -237,8 +251,8 @@ mod tests {
     fn atomic_write_replaces() {
         let t = TempDir::new();
         let p = t.path().join("a/b.json");
-        atomic_write(&p, b"1").unwrap();
-        atomic_write(&p, b"2").unwrap();
+        atomic_write(&p, b"1", NewMode::Private).unwrap();
+        atomic_write(&p, b"2", NewMode::Private).unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"2");
         assert_eq!(fs::read_dir(p.parent().unwrap()).unwrap().count(), 1);
     }
@@ -255,7 +269,7 @@ mod tests {
         // The temp name the helper used to derive from the pid alone.
         let legacy = dir.join(format!(".state.json.tmp-{}", std::process::id()));
         std::os::unix::fs::symlink(&victim, &legacy).unwrap();
-        atomic_write(&p, b"new").unwrap();
+        atomic_write(&p, b"new", NewMode::Private).unwrap();
         assert_eq!(fs::read(&victim).unwrap(), b"precious");
         assert_eq!(fs::read(&p).unwrap(), b"new");
 
@@ -271,7 +285,7 @@ mod tests {
         // A symlink at the destination is replaced, not written through.
         let link = dir.join("link.json");
         std::os::unix::fs::symlink(&victim, &link).unwrap();
-        atomic_write(&link, b"x").unwrap();
+        atomic_write(&link, b"x", NewMode::Private).unwrap();
         assert!(fs::symlink_metadata(&link).unwrap().is_file());
         use std::os::unix::fs::PermissionsExt;
         let link_mode = fs::metadata(&link).unwrap().permissions().mode() & 0o7777;
@@ -286,13 +300,13 @@ mod tests {
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
         let t = TempDir::new();
         let fresh = t.path().join("fresh");
-        atomic_write(&fresh, b"1").unwrap();
+        atomic_write(&fresh, b"1", NewMode::Private).unwrap();
         assert_eq!(mode(&fresh), NEW_FILE_MODE);
         for kept in [0o640, 0o444, 0o755, 0o4755] {
             let p = t.path().join(format!("kept-{kept:o}"));
             write(&p, "old");
             fs::set_permissions(&p, fs::Permissions::from_mode(kept)).unwrap();
-            atomic_write(&p, b"new").unwrap();
+            atomic_write(&p, b"new", NewMode::Private).unwrap();
             assert_eq!(mode(&p), kept & 0o777);
             assert_eq!(fs::read(&p).unwrap(), b"new");
         }
@@ -328,12 +342,33 @@ mod tests {
         assert_eq!(fs::read_dir(&d).unwrap().count(), 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn umask_mode_follows_the_umask_for_new_files_only() {
+        use crate::saves::testutil::under_umask_022;
+        use std::os::unix::fs::PermissionsExt;
+        if !under_umask_022("saves::fsx::tests::umask_mode_follows_the_umask_for_new_files_only") {
+            return;
+        }
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let t = TempDir::new();
+        let fresh = t.path().join("manifest.json");
+        atomic_write(&fresh, b"1", NewMode::Umask).unwrap();
+        assert_eq!(mode(&fresh), 0o644);
+        let private = t.path().join("state.json");
+        atomic_write(&private, b"1", NewMode::Private).unwrap();
+        assert_eq!(mode(&private), NEW_FILE_MODE);
+        fs::set_permissions(&fresh, fs::Permissions::from_mode(0o640)).unwrap();
+        atomic_write(&fresh, b"2", NewMode::Umask).unwrap();
+        assert_eq!(mode(&fresh), 0o640);
+    }
+
     #[test]
     fn atomic_write_leaves_no_temp_on_failure() {
         let t = TempDir::new();
         let p = t.path().join("dir-in-the-way");
         fs::create_dir_all(p.join("child")).unwrap();
-        assert!(atomic_write(&p, b"x").is_err());
+        assert!(atomic_write(&p, b"x", NewMode::Private).is_err());
         let names: Vec<_> = fs::read_dir(t.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())

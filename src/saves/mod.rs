@@ -125,6 +125,31 @@ pub(crate) mod testutil {
         std::fs::write(path, body).unwrap();
     }
 
+    /// Re-runs the test `name` in a child test process under umask 022 and
+    /// asserts it passed; true only inside that child. The umask is
+    /// process-wide, so setting it here would race concurrent tests.
+    #[cfg(unix)]
+    pub fn under_umask_022(name: &str) -> bool {
+        const CHILD: &str = "RACCOON_TEST_UMASK_022";
+        if std::env::var_os(CHILD).is_some() {
+            unsafe { libc::umask(0o022) };
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // A misspelt name runs zero tests and still exits 0.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{name} under umask 022:\n{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        false
+    }
+
     pub fn set_mtime_secs(path: &Path, secs: u64) {
         std::fs::File::open(path)
             .unwrap()

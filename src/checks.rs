@@ -966,7 +966,11 @@ fn repair_alsa_headroom() -> (bool, String) {
     {
         return (false, format!("create {}: {e}", dir.display()));
     }
-    if let Err(e) = crate::saves::fsx::atomic_write(&dst, HEADROOM_CONF.as_bytes()) {
+    if let Err(e) = crate::saves::fsx::atomic_write(
+        &dst,
+        HEADROOM_CONF.as_bytes(),
+        crate::saves::fsx::NewMode::Private,
+    ) {
         return (false, format!("write {}: {e}", dst.display()));
     }
     match run("systemctl", &["--user", "restart", "wireplumber"]) {
