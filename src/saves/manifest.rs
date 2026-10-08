@@ -78,7 +78,7 @@ impl Manifest {
     pub fn write(&self, payload_dir: &Path) -> Result<String, String> {
         let raw = serde_json::to_vec_pretty(self).map_err(|e| format!("encode manifest: {e}"))?;
         let path = payload_dir.join(MANIFEST_FILE);
-        // Another host reads the payload, like the umask-mode save files beside it.
+        // Other hosts read the payload; match the umask-mode files beside it.
         fsx::atomic_write(&path, &raw, fsx::NewMode::Umask)
             .map_err(|e| format!("write {}: {e}", path.display()))?;
         Ok(plugin_toolkit::hash::sha256_hex(&raw))
@@ -317,7 +317,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn manifest_mode_matches_the_payload_files() {
+        use crate::saves::testutil::under_umask_022;
         use std::os::unix::fs::PermissionsExt;
+        if !under_umask_022("saves::manifest::tests::manifest_mode_matches_the_payload_files") {
+            return;
+        }
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
         let t = TempDir::new();
         let save = t.path().join("src/save.dat");
@@ -333,10 +337,8 @@ mod tests {
         }];
         capture(&plan, &payload, "hades", "Hades", "bragi").unwrap();
 
-        let reference = t.path().join("reference");
-        fs::File::create(&reference).unwrap();
         let manifest = payload.join(MANIFEST_FILE);
-        assert_eq!(mode(&manifest), mode(&reference));
+        assert_eq!(mode(&manifest), 0o644);
         assert_eq!(
             mode(&manifest),
             mode(&payload.join("files/wine-user/save.dat"))

@@ -54,8 +54,7 @@ fn copy_into(src: &Path, out: &mut File, dst: &Path) -> io::Result<(u64, String)
 /// Mode of a file [`atomic_write`] creates with [`NewMode::Private`].
 pub const NEW_FILE_MODE: u32 = 0o600;
 
-/// The mode [`atomic_write`] gives a file it creates; a replaced regular file
-/// always keeps its own.
+/// The mode [`atomic_write`] gives a file it creates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewMode {
     /// [`NEW_FILE_MODE`], whatever the umask: this host's own state.
@@ -346,16 +345,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn umask_mode_follows_the_umask_for_new_files_only() {
+        use crate::saves::testutil::under_umask_022;
         use std::os::unix::fs::PermissionsExt;
+        if !under_umask_022("saves::fsx::tests::umask_mode_follows_the_umask_for_new_files_only") {
+            return;
+        }
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
         let t = TempDir::new();
-        // `File::create` is the umask reference; setting the umask would race
-        // other tests in the process.
-        let reference = t.path().join("reference");
-        File::create(&reference).unwrap();
         let fresh = t.path().join("manifest.json");
         atomic_write(&fresh, b"1", NewMode::Umask).unwrap();
-        assert_eq!(mode(&fresh), mode(&reference));
+        assert_eq!(mode(&fresh), 0o644);
+        let private = t.path().join("state.json");
+        atomic_write(&private, b"1", NewMode::Private).unwrap();
+        assert_eq!(mode(&private), NEW_FILE_MODE);
         fs::set_permissions(&fresh, fs::Permissions::from_mode(0o640)).unwrap();
         atomic_write(&fresh, b"2", NewMode::Umask).unwrap();
         assert_eq!(mode(&fresh), 0o640);
