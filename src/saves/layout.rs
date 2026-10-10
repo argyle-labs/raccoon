@@ -220,7 +220,12 @@ fn find_prefixes(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     }
 }
 
-const STEAM_ROOTS: [&str; 2] = [".local/share/Steam", ".steam/steam"];
+/// Native, legacy-symlink, then Flatpak install locations.
+pub(crate) const STEAM_ROOTS: [&str; 3] = [
+    ".local/share/Steam",
+    ".steam/steam",
+    ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+];
 
 pub fn steam_root(home: &Path) -> Option<PathBuf> {
     STEAM_ROOTS
@@ -229,7 +234,7 @@ pub fn steam_root(home: &Path) -> Option<PathBuf> {
         .find(|p| p.is_dir())
 }
 
-/// Libraries under every Steam root present, deduped.
+/// Libraries under every Steam root present (native and Flatpak), deduped.
 pub fn all_steam_libraries(home: &Path) -> Vec<PathBuf> {
     let mut libs: Vec<PathBuf> = STEAM_ROOTS
         .iter()
@@ -419,14 +424,16 @@ mod tests {
     fn all_steam_libraries_spans_roots_and_dedups() {
         let t = TempDir::new();
         let native = t.path().join(".local/share/Steam");
-        let legacy = t.path().join(".steam/steam");
+        let flatpak = t
+            .path()
+            .join(".var/app/com.valvesoftware.Steam/.local/share/Steam");
         let extra = t.path().join("games");
         fs::create_dir_all(native.join("steamapps")).unwrap();
-        fs::create_dir_all(legacy.join("steamapps")).unwrap();
+        fs::create_dir_all(flatpak.join("steamapps")).unwrap();
         fs::create_dir_all(&extra).unwrap();
         let vdf = format!("\"path\"\t\t\"{}\"\n", extra.display());
         fs::write(native.join("steamapps/libraryfolders.vdf"), &vdf).unwrap();
-        fs::write(legacy.join("steamapps/libraryfolders.vdf"), &vdf).unwrap();
-        assert_eq!(all_steam_libraries(t.path()), vec![native, extra, legacy]);
+        fs::write(flatpak.join("steamapps/libraryfolders.vdf"), &vdf).unwrap();
+        assert_eq!(all_steam_libraries(t.path()), vec![native, extra, flatpak]);
     }
 }
