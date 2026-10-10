@@ -220,11 +220,39 @@ fn find_prefixes(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     }
 }
 
+const STEAM_ROOTS: [&str; 3] = [
+    ".local/share/Steam",
+    ".steam/steam",
+    ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+];
+
 pub fn steam_root(home: &Path) -> Option<PathBuf> {
-    [".local/share/Steam", ".steam/steam"]
+    STEAM_ROOTS
         .iter()
         .map(|r| home.join(r))
         .find(|p| p.is_dir())
+}
+
+/// Libraries of every installed Steam (native and Flatpak), deduped.
+pub fn all_steam_libraries(home: &Path) -> Vec<PathBuf> {
+    let mut libs: Vec<PathBuf> = STEAM_ROOTS
+        .iter()
+        .map(|r| home.join(r))
+        .filter(|p| p.is_dir())
+        .flat_map(|root| steam_libraries(&root))
+        .collect();
+    dedup_canonical(&mut libs);
+    libs
+}
+
+fn dedup_canonical(libs: &mut Vec<PathBuf>) {
+    let mut seen = Vec::new();
+    libs.retain(|p| {
+        let c = p.canonicalize().unwrap_or_else(|_| p.clone());
+        let fresh = !seen.contains(&c);
+        seen.push(c);
+        fresh
+    });
 }
 
 /// The root plus every `"path"` in `libraryfolders.vdf`, deduped.
@@ -233,13 +261,7 @@ fn steam_libraries(steam: &Path) -> Vec<PathBuf> {
     if let Ok(vdf) = fs::read_to_string(steam.join("steamapps/libraryfolders.vdf")) {
         libs.extend(library_paths(&vdf).into_iter().map(PathBuf::from));
     }
-    let mut seen = Vec::new();
-    libs.retain(|p| {
-        let c = p.canonicalize().unwrap_or_else(|_| p.clone());
-        let fresh = !seen.contains(&c);
-        seen.push(c);
-        fresh
-    });
+    dedup_canonical(&mut libs);
     libs
 }
 
@@ -395,5 +417,22 @@ mod tests {
     fn vdf_paths_parse() {
         let vdf = "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"/home/u/.local/share/Steam\"\n\t\t\"label\"\t\t\"\"\n\t}\n}";
         assert_eq!(library_paths(vdf), vec!["/home/u/.local/share/Steam"]);
+    }
+
+    #[test]
+    fn all_steam_libraries_includes_flatpak_and_dedups() {
+        let t = TempDir::new();
+        let native = t.path().join(".local/share/Steam");
+        let flatpak = t
+            .path()
+            .join(".var/app/com.valvesoftware.Steam/.local/share/Steam");
+        let extra = t.path().join("games");
+        fs::create_dir_all(native.join("steamapps")).unwrap();
+        fs::create_dir_all(flatpak.join("steamapps")).unwrap();
+        fs::create_dir_all(&extra).unwrap();
+        let vdf = format!("\"path\"\t\t\"{}\"\n", extra.display());
+        fs::write(native.join("steamapps/libraryfolders.vdf"), &vdf).unwrap();
+        fs::write(flatpak.join("steamapps/libraryfolders.vdf"), &vdf).unwrap();
+        assert_eq!(all_steam_libraries(t.path()), vec![native, extra, flatpak]);
     }
 }
