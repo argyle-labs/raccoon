@@ -56,6 +56,7 @@ pub fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         check_suspend_wakeup(),
         check_gpu_perf(),
         check_shader_cache(),
+        check_download_contention(),
         check_vrr(),
         check_dev_toolchain(),
         check_kde_apps(),
@@ -405,6 +406,115 @@ fn check_shader_cache() -> Option<Finding> {
             None, // manual Steam UI setting; no auto repair
         ))
     }
+}
+
+/// Steam downloading while a game runs starves the render thread (CPU decompression +
+/// disk writeback), which presents as stutter that lowering graphics settings won't fix.
+fn check_download_contention() -> Option<Finding> {
+    let roots: Vec<PathBuf> = [
+        home().join(".steam/steam"),
+        home().join(".local/share/Steam"),
+    ]
+    .into_iter()
+    .filter(|p| p.exists())
+    .collect();
+    if roots.is_empty() {
+        return None;
+    }
+    let mut libraries: Vec<PathBuf> = roots.clone();
+    for root in &roots {
+        if let Ok(vdf) = fs::read_to_string(root.join("steamapps/libraryfolders.vdf")) {
+            libraries.extend(library_paths(&vdf).into_iter().map(PathBuf::from));
+        }
+    }
+    // ~/.steam/steam is usually a symlink to ~/.local/share/Steam.
+    let mut libraries: Vec<PathBuf> = libraries
+        .into_iter()
+        .map(|p| fs::canonicalize(&p).unwrap_or(p))
+        .collect();
+    libraries.sort();
+    libraries.dedup();
+    let downloading: Vec<String> = libraries
+        .iter()
+        .flat_map(|lib| active_downloads(&lib.join("steamapps/downloading")))
+        .collect();
+    contention_finding(running_game_appid(), downloading)
+}
+
+fn contention_finding(game: Option<String>, downloading: Vec<String>) -> Option<Finding> {
+    let game = game?;
+    if downloading.is_empty() {
+        return Some(finding(
+            "download-contention",
+            Severity::Ok,
+            "No Steam downloads during play",
+            format!("app {game} running with no active Steam downloads"),
+            None,
+        ));
+    }
+    Some(finding(
+        "download-contention",
+        Severity::Warn,
+        "Steam downloading during gameplay",
+        format!(
+            "app {game} running while Steam downloads app(s) {} — download decompression and disk writeback starve the game (stutter that graphics settings won't fix); pause downloads, or disable Steam → Settings → Downloads → Allow downloads during gameplay",
+            downloading.join(", ")
+        ),
+        None,
+    ))
+}
+
+/// `"path"` values from `libraryfolders.vdf`.
+fn library_paths(vdf: &str) -> Vec<String> {
+    vdf.lines()
+        .filter_map(|line| {
+            let mut quoted = line.split('"').skip(1).step_by(2);
+            match (quoted.next(), quoted.next()) {
+                (Some("path"), Some(v)) if !v.is_empty() => Some(v.replace("\\\\", "\\")),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// App ids with a non-empty staging dir under `steamapps/downloading/`.
+/// Empty dirs are leftovers from finished downloads.
+fn active_downloads(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter(|e| {
+            fs::read_dir(e.path())
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+        })
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Steam launches every game under `reaper SteamLaunch AppId=<id>`.
+fn running_game_appid() -> Option<String> {
+    fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
+        let raw = fs::read(e.path().join("cmdline")).ok()?;
+        game_appid_from_cmdline(&String::from_utf8_lossy(&raw).replace('\0', " "))
+    })
+}
+
+fn game_appid_from_cmdline(cmdline: &str) -> Option<String> {
+    if !cmdline.contains("SteamLaunch") {
+        return None;
+    }
+    let id = cmdline
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("AppId="))?;
+    // AppId=0 is Steam's own non-game launch (e.g. Big Picture shortcuts).
+    (id != "0" && !id.is_empty() && id.chars().all(|c| c.is_ascii_digit())).then(|| id.to_string())
 }
 
 /// VRR/adaptive-sync: capable panels game much smoother with it on. We can read
@@ -1679,5 +1789,55 @@ mod tests {
         let o: RepairOutcome = serde_json::from_str(&out).unwrap();
         assert!(!o.ok);
         assert!(o.message.contains("no repair"));
+    }
+
+    #[test]
+    fn contention_is_silent_without_a_running_game() {
+        assert!(contention_finding(None, vec!["730".into()]).is_none());
+    }
+
+    #[test]
+    fn contention_warns_when_downloading_during_play() {
+        let f = contention_finding(Some("1091500".into()), vec!["730".into()]).unwrap();
+        assert!(matches!(f.severity, Severity::Warn));
+        assert!(f.detail.contains("730"));
+        let ok = contention_finding(Some("1091500".into()), vec![]).unwrap();
+        assert!(matches!(ok.severity, Severity::Ok));
+    }
+
+    #[test]
+    fn appid_parsed_only_from_steam_game_launches() {
+        let reaper = "/home/u/.steam/ubuntu12_32/reaper SteamLaunch AppId=1091500 -- proton waitforexitandrun game.exe";
+        assert_eq!(game_appid_from_cmdline(reaper).as_deref(), Some("1091500"));
+        assert_eq!(
+            game_appid_from_cmdline("reaper SteamLaunch AppId=0 -- x"),
+            None
+        );
+        assert_eq!(
+            game_appid_from_cmdline("steamwebhelper AppId=1091500"),
+            None
+        );
+    }
+
+    #[test]
+    fn library_paths_parse_vdf_and_unescape() {
+        let vdf = "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"/home/u/.local/share/Steam\"\n\t\t\"label\"\t\t\"\"\n\t}\n\t\"1\"\n\t{\n\t\t\"path\"\t\t\"/run/media/games\"\n\t}\n}\n";
+        assert_eq!(
+            library_paths(vdf),
+            vec!["/home/u/.local/share/Steam", "/run/media/games"]
+        );
+    }
+
+    #[test]
+    fn only_non_empty_numeric_staging_dirs_count_as_downloads() {
+        let dir = std::env::temp_dir().join(format!("raccoon-dl-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(dir.join("730")).unwrap();
+        fs::write(dir.join("730/chunk"), b"x").unwrap();
+        fs::create_dir_all(dir.join("440")).unwrap();
+        fs::create_dir_all(dir.join("state")).unwrap();
+        fs::write(dir.join("state/f"), b"x").unwrap();
+        assert_eq!(active_downloads(&dir), vec!["730".to_string()]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
