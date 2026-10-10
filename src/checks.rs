@@ -411,91 +411,126 @@ fn check_shader_cache() -> Option<Finding> {
 /// Steam downloading while a game runs starves the render thread (CPU decompression +
 /// disk writeback), which presents as stutter that lowering graphics settings won't fix.
 fn check_download_contention() -> Option<Finding> {
-    let roots: Vec<PathBuf> = [
-        home().join(".steam/steam"),
-        home().join(".local/share/Steam"),
-    ]
-    .into_iter()
-    .filter(|p| p.exists())
-    .collect();
-    if roots.is_empty() {
+    let libraries = crate::saves::layout::all_steam_libraries(&home());
+    if libraries.is_empty() {
         return None;
     }
-    let mut libraries: Vec<PathBuf> = roots.clone();
-    for root in &roots {
-        if let Ok(vdf) = fs::read_to_string(root.join("steamapps/libraryfolders.vdf")) {
-            libraries.extend(library_paths(&vdf).into_iter().map(PathBuf::from));
+    let mut active = Vec::new();
+    let mut pending = Vec::new();
+    for lib in &libraries {
+        for (appid, state) in manifest_states(&lib.join("steamapps")) {
+            match state {
+                DownloadState::Active => active.push(appid),
+                DownloadState::Pending => pending.push(appid),
+                DownloadState::Idle => {}
+            }
         }
     }
-    // ~/.steam/steam is usually a symlink to ~/.local/share/Steam.
-    let mut libraries: Vec<PathBuf> = libraries
-        .into_iter()
-        .map(|p| fs::canonicalize(&p).unwrap_or(p))
-        .collect();
-    libraries.sort();
-    libraries.dedup();
-    let downloading: Vec<String> = libraries
-        .iter()
-        .flat_map(|lib| active_downloads(&lib.join("steamapps/downloading")))
-        .collect();
-    contention_finding(running_game_appid(), downloading)
+    contention_finding(running_game_appid(), active, pending)
 }
 
-fn contention_finding(game: Option<String>, downloading: Vec<String>) -> Option<Finding> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadState {
+    Active,
+    /// Queued or paused; Steam resumes it when gameplay ends unless downloads
+    /// during gameplay are allowed.
+    Pending,
+    Idle,
+}
+
+// EAppState bits from appmanifest StateFlags.
+const STATE_UPDATE_REQUIRED: u64 = 0x2;
+const STATE_UPDATE_RUNNING: u64 = 0x100;
+const STATE_UPDATE_PAUSED: u64 = 0x200;
+const STATE_UPDATE_STARTED: u64 = 0x400;
+const STATE_ACTIVE_MASK: u64 = STATE_UPDATE_RUNNING
+    | 0x8_0000 // preallocating
+    | 0x10_0000 // downloading
+    | 0x20_0000 // staging
+    | 0x40_0000; // committing
+
+fn download_state(acf: &str) -> DownloadState {
+    let num = |key: &str| -> Option<u64> {
+        acf.lines().find_map(|line| {
+            let q: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+            match q.as_slice() {
+                [k, v] if *k == key => v.parse().ok(),
+                _ => None,
+            }
+        })
+    };
+    let flags = num("StateFlags").unwrap_or(0);
+    let remaining = num("BytesToDownload").unwrap_or(0) > num("BytesDownloaded").unwrap_or(0);
+    if flags & STATE_UPDATE_PAUSED == 0 && flags & STATE_ACTIVE_MASK != 0 {
+        DownloadState::Active
+    } else if remaining
+        || flags & (STATE_UPDATE_REQUIRED | STATE_UPDATE_PAUSED | STATE_UPDATE_STARTED) != 0
+    {
+        DownloadState::Pending
+    } else {
+        DownloadState::Idle
+    }
+}
+
+/// `(appid, state)` for every `appmanifest_<id>.acf` in a `steamapps` dir.
+fn manifest_states(steamapps: &Path) -> Vec<(String, DownloadState)> {
+    let Ok(entries) = fs::read_dir(steamapps) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, DownloadState)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            let id = name.strip_prefix("appmanifest_")?.strip_suffix(".acf")?;
+            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let acf = fs::read_to_string(e.path()).ok()?;
+            Some((id.to_string(), download_state(&acf)))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn contention_finding(
+    game: Option<String>,
+    active: Vec<String>,
+    pending: Vec<String>,
+) -> Option<Finding> {
     let game = game?;
-    if downloading.is_empty() {
+    if !active.is_empty() {
         return Some(finding(
             "download-contention",
-            Severity::Ok,
-            "No Steam downloads during play",
-            format!("app {game} running with no active Steam downloads"),
+            Severity::Warn,
+            "Steam downloading during gameplay",
+            format!(
+                "app {game} running while Steam actively downloads app(s) {} — decompression and disk writeback starve the game (stutter that graphics settings won't fix); pause downloads, or disable Steam → Settings → Downloads → Allow downloads during gameplay",
+                active.join(", ")
+            ),
+            None,
+        ));
+    }
+    if !pending.is_empty() {
+        return Some(finding(
+            "download-contention",
+            Severity::Info,
+            "Steam downloads pending",
+            format!(
+                "app {game} running; downloads for app(s) {} are queued or paused and not contending",
+                pending.join(", ")
+            ),
             None,
         ));
     }
     Some(finding(
         "download-contention",
-        Severity::Warn,
-        "Steam downloading during gameplay",
-        format!(
-            "app {game} running while Steam downloads app(s) {} — download decompression and disk writeback starve the game (stutter that graphics settings won't fix); pause downloads, or disable Steam → Settings → Downloads → Allow downloads during gameplay",
-            downloading.join(", ")
-        ),
+        Severity::Ok,
+        "No Steam downloads during play",
+        format!("app {game} running with no Steam downloads"),
         None,
     ))
-}
-
-/// `"path"` values from `libraryfolders.vdf`.
-fn library_paths(vdf: &str) -> Vec<String> {
-    vdf.lines()
-        .filter_map(|line| {
-            let mut quoted = line.split('"').skip(1).step_by(2);
-            match (quoted.next(), quoted.next()) {
-                (Some("path"), Some(v)) if !v.is_empty() => Some(v.replace("\\\\", "\\")),
-                _ => None,
-            }
-        })
-        .collect()
-}
-
-/// App ids with a non-empty staging dir under `steamapps/downloading/`.
-/// Empty dirs are leftovers from finished downloads.
-fn active_downloads(dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter(|e| {
-            fs::read_dir(e.path())
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false)
-        })
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
-        .collect();
-    ids.sort();
-    ids
 }
 
 /// Steam launches every game under `reaper SteamLaunch AppId=<id>`.
@@ -1793,16 +1828,7 @@ mod tests {
 
     #[test]
     fn contention_is_silent_without_a_running_game() {
-        assert!(contention_finding(None, vec!["730".into()]).is_none());
-    }
-
-    #[test]
-    fn contention_warns_when_downloading_during_play() {
-        let f = contention_finding(Some("1091500".into()), vec!["730".into()]).unwrap();
-        assert!(matches!(f.severity, Severity::Warn));
-        assert!(f.detail.contains("730"));
-        let ok = contention_finding(Some("1091500".into()), vec![]).unwrap();
-        assert!(matches!(ok.severity, Severity::Ok));
+        assert!(contention_finding(None, vec!["730".into()], vec![]).is_none());
     }
 
     #[test]
@@ -1820,24 +1846,54 @@ mod tests {
     }
 
     #[test]
-    fn library_paths_parse_vdf_and_unescape() {
-        let vdf = "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"/home/u/.local/share/Steam\"\n\t\t\"label\"\t\t\"\"\n\t}\n\t\"1\"\n\t{\n\t\t\"path\"\t\t\"/run/media/games\"\n\t}\n}\n";
-        assert_eq!(
-            library_paths(vdf),
-            vec!["/home/u/.local/share/Steam", "/run/media/games"]
-        );
+    fn contention_severity_ladder() {
+        let warn =
+            contention_finding(Some("1".into()), vec!["730".into()], vec!["440".into()]).unwrap();
+        assert!(matches!(warn.severity, Severity::Warn));
+        assert!(warn.detail.contains("730"));
+        let info = contention_finding(Some("1".into()), vec![], vec!["440".into()]).unwrap();
+        assert!(matches!(info.severity, Severity::Info));
+        let ok = contention_finding(Some("1".into()), vec![], vec![]).unwrap();
+        assert!(matches!(ok.severity, Severity::Ok));
+    }
+
+    fn acf(flags: u64, done: u64, total: u64) -> String {
+        format!(
+            "\"AppState\"\n{{\n\t\"appid\"\t\t\"730\"\n\t\"StateFlags\"\t\t\"{flags}\"\n\t\"BytesToDownload\"\t\t\"{total}\"\n\t\"BytesDownloaded\"\t\t\"{done}\"\n}}\n"
+        )
     }
 
     #[test]
-    fn only_non_empty_numeric_staging_dirs_count_as_downloads() {
-        let dir = std::env::temp_dir().join(format!("raccoon-dl-{}", std::process::id()));
-        fs::remove_dir_all(&dir).ok();
-        fs::create_dir_all(dir.join("730")).unwrap();
-        fs::write(dir.join("730/chunk"), b"x").unwrap();
-        fs::create_dir_all(dir.join("440")).unwrap();
-        fs::create_dir_all(dir.join("state")).unwrap();
-        fs::write(dir.join("state/f"), b"x").unwrap();
-        assert_eq!(active_downloads(&dir), vec!["730".to_string()]);
-        fs::remove_dir_all(&dir).unwrap();
+    fn download_state_from_state_flags_and_bytes() {
+        assert_eq!(download_state(&acf(4, 0, 0)), DownloadState::Idle);
+        assert_eq!(
+            download_state(&acf(4 | 0x100 | 0x10_0000, 10, 100)),
+            DownloadState::Active
+        );
+        // Steam's default: paused while a game runs.
+        assert_eq!(
+            download_state(&acf(4 | 0x2 | 0x200 | 0x10_0000, 10, 100)),
+            DownloadState::Pending
+        );
+        assert_eq!(download_state(&acf(4 | 0x2, 0, 0)), DownloadState::Pending);
+        assert_eq!(download_state(&acf(4, 10, 100)), DownloadState::Pending);
+    }
+
+    #[test]
+    fn manifest_states_reads_only_numeric_appmanifests() {
+        let t = crate::saves::testutil::TempDir::new();
+        let apps = t.path().join("steamapps");
+        fs::create_dir_all(&apps).unwrap();
+        fs::write(apps.join("appmanifest_730.acf"), acf(4 | 0x100, 1, 2)).unwrap();
+        fs::write(apps.join("appmanifest_440.acf"), acf(4, 0, 0)).unwrap();
+        fs::write(apps.join("appmanifest_x.acf"), acf(4 | 0x100, 1, 2)).unwrap();
+        fs::create_dir_all(apps.join("appmanifest_9.acf")).unwrap();
+        assert_eq!(
+            manifest_states(&apps),
+            vec![
+                ("440".to_string(), DownloadState::Idle),
+                ("730".to_string(), DownloadState::Active)
+            ]
+        );
     }
 }
