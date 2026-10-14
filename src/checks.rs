@@ -426,7 +426,75 @@ fn check_download_contention() -> Option<Finding> {
             }
         }
     }
-    contention_finding(running_game_appid(), active, pending)
+    let game = running_game_appid();
+    let signals = if game.is_some() && !active.is_empty() {
+        starvation_signals()
+    } else {
+        Vec::new()
+    };
+    contention_finding(game, active, pending, signals)
+}
+
+/// Live readings that corroborate contention: a busy GPU held well below its top
+/// clock means the render thread cannot feed it, distinct from a DPM cap.
+fn starvation_signals() -> Vec<String> {
+    let card = drm_glob("device/pp_dpm_sclk").into_iter().next();
+    let sclk = card
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|t| sclk_mhz(&t));
+    let busy = card
+        .as_ref()
+        .and_then(|p| read_trim(&p.with_file_name("gpu_busy_percent").to_string_lossy()))
+        .and_then(|v| v.parse().ok());
+    let load1 = read_trim("/proc/loadavg").and_then(|l| l.split_whitespace().next()?.parse().ok());
+    let nproc = std::thread::available_parallelism().map_or(0, |n| n.get());
+    starvation_from(sclk, busy, load1, nproc)
+}
+
+/// `(current, max)` MHz from `pp_dpm_sclk`; the current level is marked `*`.
+fn sclk_mhz(table: &str) -> Option<(u32, u32)> {
+    let mut current = None;
+    let mut max = None;
+    for line in table.lines() {
+        let Some(mhz) = line.split_whitespace().find_map(|t| {
+            t.to_ascii_lowercase()
+                .strip_suffix("mhz")?
+                .parse::<u32>()
+                .ok()
+        }) else {
+            continue;
+        };
+        max = max.max(Some(mhz));
+        if line.trim_end().ends_with('*') {
+            current = Some(mhz);
+        }
+    }
+    Some((current?, max?))
+}
+
+fn starvation_from(
+    sclk: Option<(u32, u32)>,
+    busy: Option<u32>,
+    load1: Option<f64>,
+    nproc: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let (Some((cur, max)), Some(busy)) = (sclk, busy)
+        && busy >= 90
+        && cur * 10 < max * 7
+    {
+        out.push(format!(
+            "GPU at {cur} of {max} MHz while {busy}% busy (starved, not capped)"
+        ));
+    }
+    if let Some(load) = load1
+        && nproc > 0
+        && load > nproc as f64
+    {
+        out.push(format!("load {load:.1} on {nproc} cores"));
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,15 +566,21 @@ fn contention_finding(
     game: Option<String>,
     active: Vec<String>,
     pending: Vec<String>,
+    signals: Vec<String>,
 ) -> Option<Finding> {
     let game = game?;
     if !active.is_empty() {
+        let corroborated = if signals.is_empty() {
+            String::new()
+        } else {
+            format!(" Observed: {}.", signals.join("; "))
+        };
         return Some(finding(
             "download-contention",
             Severity::Warn,
             "Steam downloading during gameplay",
             format!(
-                "app {game} running while Steam actively downloads app(s) {} — decompression and disk writeback starve the game (stutter that graphics settings won't fix); pause downloads, or disable Steam → Settings → Downloads → Allow downloads during gameplay",
+                "app {game} running while Steam actively downloads app(s) {} — decompression and disk writeback starve the game (stutter that graphics settings won't fix); pause downloads, or disable Steam → Settings → Downloads → Allow downloads during gameplay.{corroborated}",
                 active.join(", ")
             ),
             None,
@@ -1828,7 +1902,7 @@ mod tests {
 
     #[test]
     fn contention_is_silent_without_a_running_game() {
-        assert!(contention_finding(None, vec!["730".into()], vec![]).is_none());
+        assert!(contention_finding(None, vec!["730".into()], vec![], vec!["x".into()]).is_none());
     }
 
     #[test]
@@ -1847,14 +1921,39 @@ mod tests {
 
     #[test]
     fn contention_severity_ladder() {
-        let warn =
-            contention_finding(Some("1".into()), vec!["730".into()], vec!["440".into()]).unwrap();
+        let warn = contention_finding(
+            Some("1".into()),
+            vec!["730".into()],
+            vec!["440".into()],
+            vec!["load 14.7 on 8 cores".into()],
+        )
+        .unwrap();
         assert!(matches!(warn.severity, Severity::Warn));
         assert!(warn.detail.contains("730"));
-        let info = contention_finding(Some("1".into()), vec![], vec!["440".into()]).unwrap();
+        assert!(warn.detail.contains("Observed: load 14.7 on 8 cores."));
+        let info =
+            contention_finding(Some("1".into()), vec![], vec!["440".into()], vec![]).unwrap();
         assert!(matches!(info.severity, Severity::Info));
-        let ok = contention_finding(Some("1".into()), vec![], vec![]).unwrap();
+        let ok = contention_finding(Some("1".into()), vec![], vec![], vec![]).unwrap();
         assert!(matches!(ok.severity, Severity::Ok));
+    }
+
+    #[test]
+    fn sclk_table_parses_current_and_max() {
+        let t = "0: 500Mhz \n1: 1697Mhz *\n2: 3076Mhz \n";
+        assert_eq!(sclk_mhz(t), Some((1697, 3076)));
+        assert_eq!(sclk_mhz("0: 500Mhz \n1: 900Mhz \n"), None);
+    }
+
+    #[test]
+    fn starvation_needs_a_busy_gpu_well_below_max_clock() {
+        let starved = starvation_from(Some((1697, 3076)), Some(97), Some(14.7), 8);
+        assert_eq!(starved.len(), 2, "{starved:?}");
+        assert!(starved[0].contains("1697 of 3076 MHz while 97% busy"));
+        assert!(starved[1].contains("load 14.7 on 8 cores"));
+        assert!(starvation_from(Some((3076, 3076)), Some(97), Some(2.0), 8).is_empty());
+        assert!(starvation_from(Some((1697, 3076)), Some(40), None, 8).is_empty());
+        assert!(starvation_from(None, None, Some(9.0), 0).is_empty());
     }
 
     fn acf(flags: u64, done: u64, total: u64) -> String {
