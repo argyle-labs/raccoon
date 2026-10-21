@@ -432,7 +432,8 @@ fn check_download_contention() -> Option<Finding> {
     } else {
         Vec::new()
     };
-    contention_finding(game, active, pending, signals)
+    let deprioritized = steam_deprioritized(Path::new("/proc"), current_uid());
+    contention_finding(game, active, pending, signals, deprioritized)
 }
 
 /// Live readings that corroborate contention: a busy GPU held well below its top
@@ -567,7 +568,22 @@ fn contention_finding(
     active: Vec<String>,
     pending: Vec<String>,
     signals: Vec<String>,
+    deprioritized: bool,
 ) -> Option<Finding> {
+    if deprioritized && (game.is_none() || active.is_empty()) {
+        return Some(finding(
+            "download-contention-restore",
+            Severity::Info,
+            "Steam client still deprioritized",
+            "download contention has cleared but the Steam client still runs at nice 19 + idle IO; later games would inherit it".to_string(),
+            Some(repair_spec(
+                "download-contention-restore",
+                "restore the Steam client to normal CPU and IO priority",
+                true,
+                false,
+            )),
+        ));
+    }
     let game = game?;
     if !active.is_empty() {
         let corroborated = if signals.is_empty() {
@@ -1127,7 +1143,12 @@ pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
         "scx" => repair_scx(),
         "suspend-wakeup" => repair_suspend_wakeup(),
         "gpu-perf" => repair_gpu_perf(),
-        "download-contention" => repair_download_contention(),
+        "download-contention" => {
+            repair_download_contention(Path::new("/proc"), current_uid(), &run)
+        }
+        "download-contention-restore" => {
+            restore_download_contention(Path::new("/proc"), current_uid(), &run)
+        }
         "dev-toolchain" => repair_dev_toolchain(),
         "kde-apps" => repair_kde_apps(),
         "gaming-stack" => repair_gaming_stack(),
@@ -1246,28 +1267,64 @@ fn repair_scx() -> (bool, String) {
     }
 }
 
-fn repair_download_contention() -> (bool, String) {
-    let pids = steam_client_pids();
-    if pids.is_empty() {
+type Runner<'a> = &'a dyn Fn(&str, &[&str]) -> Result<String, String>;
+
+fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+fn repair_download_contention(proc_root: &Path, uid: u32, run: Runner) -> (bool, String) {
+    set_steam_priority(
+        proc_root,
+        uid,
+        run,
+        ("19", "3", None),
+        "set to nice 19 + idle IO; downloads keep running but yield to the game",
+        "deprioritize",
+    )
+}
+
+fn restore_download_contention(proc_root: &Path, uid: u32, run: Runner) -> (bool, String) {
+    set_steam_priority(
+        proc_root,
+        uid,
+        run,
+        ("0", "2", Some("4")),
+        "restored to nice 0 + best-effort IO",
+        "restore",
+    )
+}
+
+fn set_steam_priority(
+    proc_root: &Path,
+    uid: u32,
+    run: Runner,
+    (nice, class, level): (&str, &str, Option<&str>),
+    done: &str,
+    verb: &str,
+) -> (bool, String) {
+    let tids = steam_client_threads(proc_root, uid);
+    if tids.is_empty() {
         return (false, "no Steam client process found".to_string());
     }
-    let ids: Vec<&str> = pids.iter().map(String::as_str).collect();
-    let mut nice = vec!["-n", "19", "-p"];
-    nice.extend_from_slice(&ids);
-    let mut io = vec!["-c", "3", "-p"];
+    let ids: Vec<&str> = tids.iter().map(String::as_str).collect();
+    let mut renice = vec!["-n", nice, "-p"];
+    renice.extend_from_slice(&ids);
+    let mut io = vec!["-c", class];
+    if let Some(level) = level {
+        io.extend_from_slice(&["-n", level]);
+    }
+    io.push("-p");
     io.extend_from_slice(&ids);
-    match (run("renice", &nice), run("ionice", &io)) {
+    match (run("renice", &renice), run("ionice", &io)) {
         (Ok(_), Ok(_)) => (
             true,
-            format!(
-                "Steam client ({}) set to nice 19 + idle IO; downloads keep running but yield to the game",
-                ids.join(", ")
-            ),
+            format!("Steam client threads ({}) {done}", ids.join(", ")),
         ),
         (r, i) => (
             false,
             format!(
-                "deprioritize failed: {}",
+                "{verb} failed: {}",
                 [r.err(), i.err()]
                     .into_iter()
                     .flatten()
@@ -1278,18 +1335,61 @@ fn repair_download_contention() -> (bool, String) {
     }
 }
 
-fn steam_client_pids() -> Vec<String> {
-    let Ok(entries) = fs::read_dir("/proc") else {
+fn owner_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn steam_client_threads(proc_root: &Path, uid: u32) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(proc_root) else {
         return Vec::new();
     };
-    entries
+    let mut tids: Vec<String> = entries
         .flatten()
-        .filter_map(|e| {
-            let pid = e.file_name().to_string_lossy().into_owned();
-            pid.parse::<u32>().ok()?;
-            is_steam_client(&fs::read_to_string(e.path().join("comm")).ok()?).then_some(pid)
+        .filter(|e| e.file_name().to_string_lossy().parse::<u32>().is_ok())
+        .filter(|e| {
+            fs::read_to_string(e.path().join("comm")).is_ok_and(|c| is_steam_client(&c))
+                && fs::read_to_string(e.path().join("status"))
+                    .ok()
+                    .and_then(|s| owner_uid(&s))
+                    == Some(uid)
         })
-        .collect()
+        .flat_map(|e| {
+            fs::read_dir(e.path().join("task"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|t| t.file_name().to_string_lossy().into_owned())
+                .filter(|t| t.parse::<u32>().is_ok())
+        })
+        .collect();
+    tids.sort_by_key(|t| t.parse::<u32>().unwrap_or_default());
+    tids
+}
+
+fn stat_nice(stat: &str) -> Option<i32> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(16)?
+        .parse()
+        .ok()
+}
+
+fn steam_deprioritized(proc_root: &Path, uid: u32) -> bool {
+    steam_client_threads(proc_root, uid).iter().any(|tid| {
+        fs::read_dir(proc_root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| fs::read_to_string(e.path().join("task").join(tid).join("stat")).ok())
+            .any(|stat| stat_nice(&stat) == Some(19))
+    })
 }
 
 fn is_steam_client(comm: &str) -> bool {
@@ -1958,7 +2058,29 @@ mod tests {
 
     #[test]
     fn contention_is_silent_without_a_running_game() {
-        assert!(contention_finding(None, vec!["730".into()], vec![], vec!["x".into()]).is_none());
+        assert!(
+            contention_finding(None, vec!["730".into()], vec![], vec!["x".into()], false).is_none()
+        );
+    }
+
+    #[test]
+    fn cleared_contention_offers_restore() {
+        for (game, active) in [
+            (None, vec!["730".to_string()]),
+            (Some("1".to_string()), vec![]),
+        ] {
+            let f = contention_finding(game, active, vec![], vec![], true).unwrap();
+            assert_eq!(
+                f.repair.as_ref().map(|r| r.id.as_str()),
+                Some("download-contention-restore")
+            );
+        }
+        let still =
+            contention_finding(Some("1".into()), vec!["730".into()], vec![], vec![], true).unwrap();
+        assert_eq!(
+            still.repair.as_ref().map(|r| r.id.as_str()),
+            Some("download-contention")
+        );
     }
 
     #[test]
@@ -1982,6 +2104,7 @@ mod tests {
             vec!["730".into()],
             vec!["440".into()],
             vec!["load 14.7 on 8 cores".into()],
+            false,
         )
         .unwrap();
         assert!(matches!(warn.severity, Severity::Warn));
@@ -1991,11 +2114,11 @@ mod tests {
             warn.repair.as_ref().map(|r| r.id.as_str()),
             Some("download-contention")
         );
-        let info =
-            contention_finding(Some("1".into()), vec![], vec!["440".into()], vec![]).unwrap();
+        let info = contention_finding(Some("1".into()), vec![], vec!["440".into()], vec![], false)
+            .unwrap();
         assert!(matches!(info.severity, Severity::Info));
         assert!(info.repair.is_none());
-        let ok = contention_finding(Some("1".into()), vec![], vec![], vec![]).unwrap();
+        let ok = contention_finding(Some("1".into()), vec![], vec![], vec![], false).unwrap();
         assert!(matches!(ok.severity, Severity::Ok));
     }
 
@@ -2064,13 +2187,71 @@ mod tests {
         assert!(!is_steam_client("reaper\n"));
     }
 
+    type FakeProc<'a> = (&'a str, &'a str, u32, &'a [(&'a str, i32)]);
+
+    fn fake_proc(procs: &[FakeProc]) -> crate::saves::testutil::TempDir {
+        let root = crate::saves::testutil::TempDir::new();
+        for (pid, comm, uid, tasks) in procs {
+            let dir = root.path().join(pid);
+            fs::create_dir_all(dir.join("task")).unwrap();
+            fs::write(dir.join("comm"), format!("{comm}\n")).unwrap();
+            fs::write(
+                dir.join("status"),
+                format!("Name:\t{comm}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+            )
+            .unwrap();
+            for (tid, nice) in *tasks {
+                let t = dir.join("task").join(tid);
+                fs::create_dir_all(&t).unwrap();
+                let fields: Vec<String> = (3..=18).map(|i| i.to_string()).collect();
+                fs::write(
+                    t.join("stat"),
+                    format!("{tid} ({comm}) {} {nice} 1 0", fields.join(" ")),
+                )
+                .unwrap();
+            }
+        }
+        root
+    }
+
     #[test]
-    fn contention_repair_is_dispatched() {
-        let out: RepairOutcome = serde_json::from_str(
-            &repair(r#"{"provider":"raccoon","repair_id":"download-contention"}"#).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(out.id, "download-contention");
-        assert!(!out.message.contains("has no repair"));
+    fn contention_repair_targets_every_owned_steam_thread_and_restores() {
+        let root = fake_proc(&[
+            ("100", "steam", 1000, &[("100", 0), ("101", 0)]),
+            ("200", "steam", 0, &[("200", 0)]),
+            ("300", "steamwebhelper", 1000, &[("300", 0)]),
+        ]);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let run = |bin: &str, args: &[&str]| {
+            calls.borrow_mut().push(format!("{bin} {}", args.join(" ")));
+            Ok(String::new())
+        };
+        let (ok, _) = repair_download_contention(root.path(), 1000, &run);
+        assert!(ok);
+        let (ok, _) = restore_download_contention(root.path(), 1000, &run);
+        assert!(ok);
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                "renice -n 19 -p 100 101",
+                "ionice -c 3 -p 100 101",
+                "renice -n 0 -p 100 101",
+                "ionice -c 2 -n 4 -p 100 101",
+            ]
+        );
+        assert!(!repair_download_contention(root.path(), 4242, &run).0);
+    }
+
+    #[test]
+    fn deprioritized_reads_thread_nice() {
+        let low = fake_proc(&[("100", "steam", 1000, &[("100", 0), ("101", 19)])]);
+        assert!(steam_deprioritized(low.path(), 1000));
+        assert!(!steam_deprioritized(low.path(), 1));
+        let normal = fake_proc(&[("100", "steam", 1000, &[("100", 0)])]);
+        assert!(!steam_deprioritized(normal.path(), 1000));
+        assert_eq!(
+            stat_nice("1 (a b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 -5 1"),
+            Some(-5)
+        );
     }
 }
