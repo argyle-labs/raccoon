@@ -583,7 +583,12 @@ fn contention_finding(
                 "app {game} running while Steam actively downloads app(s) {} — decompression and disk writeback starve the game (stutter that graphics settings won't fix); pause downloads, or disable Steam → Settings → Downloads → Allow downloads during gameplay.{corroborated}",
                 active.join(", ")
             ),
-            None,
+            Some(repair_spec(
+                "download-contention",
+                "drop the Steam client to idle CPU and IO priority so the game wins contention",
+                true,
+                false,
+            )),
         ));
     }
     if !pending.is_empty() {
@@ -1122,6 +1127,7 @@ pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
         "scx" => repair_scx(),
         "suspend-wakeup" => repair_suspend_wakeup(),
         "gpu-perf" => repair_gpu_perf(),
+        "download-contention" => repair_download_contention(),
         "dev-toolchain" => repair_dev_toolchain(),
         "kde-apps" => repair_kde_apps(),
         "gaming-stack" => repair_gaming_stack(),
@@ -1238,6 +1244,56 @@ fn repair_scx() -> (bool, String) {
             ),
         ),
     }
+}
+
+fn repair_download_contention() -> (bool, String) {
+    let pids = steam_client_pids();
+    if pids.is_empty() {
+        return (false, "no Steam client process found".to_string());
+    }
+    let ids: Vec<&str> = pids.iter().map(String::as_str).collect();
+    let mut nice = vec!["-n", "19", "-p"];
+    nice.extend_from_slice(&ids);
+    let mut io = vec!["-c", "3", "-p"];
+    io.extend_from_slice(&ids);
+    match (run("renice", &nice), run("ionice", &io)) {
+        (Ok(_), Ok(_)) => (
+            true,
+            format!(
+                "Steam client ({}) set to nice 19 + idle IO; downloads keep running but yield to the game",
+                ids.join(", ")
+            ),
+        ),
+        (r, i) => (
+            false,
+            format!(
+                "deprioritize failed: {}",
+                [r.err(), i.err()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        ),
+    }
+}
+
+fn steam_client_pids() -> Vec<String> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_string_lossy().into_owned();
+            pid.parse::<u32>().ok()?;
+            is_steam_client(&fs::read_to_string(e.path().join("comm")).ok()?).then_some(pid)
+        })
+        .collect()
+}
+
+fn is_steam_client(comm: &str) -> bool {
+    comm.trim() == "steam"
 }
 
 fn repair_gpu_perf() -> (bool, String) {
@@ -1931,9 +1987,14 @@ mod tests {
         assert!(matches!(warn.severity, Severity::Warn));
         assert!(warn.detail.contains("730"));
         assert!(warn.detail.contains("Observed: load 14.7 on 8 cores."));
+        assert_eq!(
+            warn.repair.as_ref().map(|r| r.id.as_str()),
+            Some("download-contention")
+        );
         let info =
             contention_finding(Some("1".into()), vec![], vec!["440".into()], vec![]).unwrap();
         assert!(matches!(info.severity, Severity::Info));
+        assert!(info.repair.is_none());
         let ok = contention_finding(Some("1".into()), vec![], vec![], vec![]).unwrap();
         assert!(matches!(ok.severity, Severity::Ok));
     }
@@ -1994,5 +2055,22 @@ mod tests {
                 ("730".to_string(), DownloadState::Active)
             ]
         );
+    }
+
+    #[test]
+    fn steam_client_matches_only_the_client() {
+        assert!(is_steam_client("steam\n"));
+        assert!(!is_steam_client("steamwebhelper\n"));
+        assert!(!is_steam_client("reaper\n"));
+    }
+
+    #[test]
+    fn contention_repair_is_dispatched() {
+        let out: RepairOutcome = serde_json::from_str(
+            &repair(r#"{"provider":"raccoon","repair_id":"download-contention"}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out.id, "download-contention");
+        assert!(!out.message.contains("has no repair"));
     }
 }
