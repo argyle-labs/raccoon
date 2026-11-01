@@ -717,12 +717,6 @@ fn check_orca_unit_collision() -> Option<Finding> {
     .unwrap_or_default();
     let collided = journal_shows_collision(&journal);
     let enabled = state.unit_file_state.starts_with("enabled");
-    let repair = Some(repair_spec(
-        "orca-unit-restart",
-        "Restart the orca user daemon (systemctl --user restart orca)",
-        true,
-        false,
-    ));
     if state.active_state != "active" && enabled {
         return Some(finding(
             "orca-unit-collision",
@@ -739,7 +733,12 @@ fn check_orca_unit_collision() -> Option<Finding> {
                     ""
                 }
             ),
-            repair,
+            Some(repair_spec(
+                "orca-unit-restart",
+                "Restart the orca user daemon (systemctl --user restart orca)",
+                true,
+                false,
+            )),
         ));
     }
     if collided {
@@ -751,7 +750,7 @@ fn check_orca_unit_collision() -> Option<Finding> {
              name as the GNOME screen reader triggers steamos-manager to queue a conflicting stop); \
              it's running now but will flap again at the next boot/login until the unit is renamed"
                 .to_string(),
-            repair,
+            None, // unit is already active; restarting it now would only cause a needless brief outage
         ));
     }
     Some(finding(
