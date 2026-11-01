@@ -62,6 +62,7 @@ pub fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         check_kde_apps(),
         check_gaming_stack(),
         check_os_updates(),
+        check_orca_unit_collision(),
     ]
     .into_iter()
     .flatten()
@@ -678,6 +679,92 @@ fn check_vrr() -> Option<Finding> {
     None
 }
 
+/// orca's own user-level daemon (`systemctl --user`, unit `orca.service`) can
+/// get stuck `inactive (dead)` on Bazzite/SteamOS boxes: GNOME's unrelated
+/// "Orca" screen reader has login/boot activity that races systemd — on these
+/// hosts `steamos-manager`'s screenreader setup queues a `stop` job on the
+/// literally-named `orca.service` right as it starts, and systemd refuses the
+/// resulting restart transaction as destructive, leaving the unit `enabled`
+/// but dead until someone runs `systemctl --user restart orca` by hand.
+///
+/// This plugin only runs because the orca daemon spawned it, so it cannot
+/// observe its own daemon being down in real time — while the daemon is dead
+/// this check is simply never invoked. What it *can* do is run the next time
+/// the daemon comes back up and flag either state: the unit still stuck
+/// inactive-but-enabled (e.g. restarted manually without this repair), or a
+/// recent collision in the journal even though the unit is active again —
+/// a near-miss that will recur at the next boot/login until the unit is
+/// renamed (tracked separately in orca-core; out of scope here).
+fn check_orca_unit_collision() -> Option<Finding> {
+    which("systemctl")?;
+    let show = run_ok(
+        "systemctl",
+        &[
+            "--user",
+            "show",
+            "orca",
+            "--property=LoadState,ActiveState,UnitFileState",
+        ],
+    )?;
+    let state = parse_unit_show(&show);
+    if state.load_state != "loaded" {
+        return None; // no orca.service user unit on this host
+    }
+    let journal = run_ok(
+        "journalctl",
+        &["--user", "-u", "orca", "--since", "-2h", "--no-pager"],
+    )
+    .unwrap_or_default();
+    let collided = journal_shows_collision(&journal);
+    let enabled = state.unit_file_state.starts_with("enabled");
+    if state.active_state != "active" && enabled {
+        return Some(finding(
+            "orca-unit-collision",
+            Severity::Warn,
+            "orca daemon is down (stuck inactive)",
+            format!(
+                "orca.service user unit is enabled but reports '{}' — the fleet has lost this host \
+                 until it's restarted{}",
+                state.active_state,
+                if collided {
+                    "; the journal shows the GNOME-screen-reader stop/restart collision \
+                     (steamos-manager queues a conflicting stop at boot/login)"
+                } else {
+                    ""
+                }
+            ),
+            Some(repair_spec(
+                "orca-unit-restart",
+                "Restart the orca user daemon (systemctl --user restart orca)",
+                true,
+                false,
+            )),
+        ));
+    }
+    if collided {
+        return Some(finding(
+            "orca-unit-collision",
+            Severity::Warn,
+            "orca daemon recently hit a restart collision",
+            "the journal shows a recent stop/restart transaction collision on orca.service (same \
+             name as the GNOME screen reader triggers steamos-manager to queue a conflicting stop); \
+             it's running now but will flap again at the next boot/login until the unit is renamed"
+                .to_string(),
+            None, // unit is already active; restarting it now would only cause a needless brief outage
+        ));
+    }
+    Some(finding(
+        "orca-unit-collision",
+        Severity::Ok,
+        "orca daemon healthy",
+        format!(
+            "orca.service reports '{}', no recent restart collision in the journal",
+            state.active_state
+        ),
+        None,
+    ))
+}
+
 // ── provisioning (dev / desktop / gaming) ───────────────────────────────────────
 // Presence checks for the three setup concerns; each repair installs the missing
 // packages via the host package manager (privileged, non-automatic). The
@@ -1126,6 +1213,57 @@ fn repair_gaming_stack() -> (bool, String) {
     }
 }
 
+/// Restart the stuck orca user daemon. `reset-failed` clears any leftover
+/// failed-job state from the refused transaction before the restart, since a
+/// unit systemd still considers mid-transaction can reject a plain restart
+/// too. Verifies the unit actually reports `active` afterward rather than
+/// trusting the restart command's exit code alone.
+fn repair_orca_unit_collision() -> (bool, String) {
+    if which("systemctl").is_none() {
+        return (false, "systemctl not found".to_string());
+    }
+    run("systemctl", &["--user", "reset-failed", "orca"]).ok();
+    match run("systemctl", &["--user", "restart", "orca"]) {
+        Ok(_) => {
+            let show = run_ok(
+                "systemctl",
+                &["--user", "show", "orca", "--property=ActiveState"],
+            )
+            .unwrap_or_default();
+            let state = parse_unit_show(&show);
+            if state.active_state == "active" {
+                let ports = run_ok("ss", &["-ltnp"])
+                    .map(|out| parse_listening_ports(&out, "orca"))
+                    .unwrap_or_default();
+                let port_msg = if ports.is_empty() {
+                    String::new()
+                } else {
+                    format!(", listening on {}", ports.join(", "))
+                };
+                (
+                    true,
+                    format!("orca daemon restarted and reports active (running){port_msg}"),
+                )
+            } else {
+                (
+                    false,
+                    format!(
+                        "restart command succeeded but unit reports '{}' (not active); run: \
+                         systemctl --user status orca",
+                        state.active_state
+                    ),
+                )
+            }
+        }
+        Err(e) => (
+            false,
+            format!(
+                "systemctl --user restart orca failed ({e}); run: systemctl --user restart orca"
+            ),
+        ),
+    }
+}
+
 // ── repair ─────────────────────────────────────────────────────────────────────
 
 /// Run one repair by id and return a [`RepairOutcome`] as JSON.
@@ -1154,6 +1292,7 @@ pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
         "gaming-stack" => repair_gaming_stack(),
         "os-updates" => repair_os_updates(),
         "os-updates-probe" => pm_install(&["pacman-contrib"]),
+        "orca-unit-restart" => repair_orca_unit_collision(),
         other => (false, format!("raccoon has no repair '{other}'")),
     };
     RepairOutcome {
@@ -1883,6 +2022,46 @@ pub(crate) fn run_ok(bin: &str, args: &[&str]) -> Option<String> {
     run(bin, args).ok()
 }
 
+/// Fields pulled from `systemctl show --property=...`, one `Key=Value` per line.
+struct UnitShow {
+    load_state: String,
+    active_state: String,
+    unit_file_state: String,
+}
+
+fn parse_unit_show(text: &str) -> UnitShow {
+    let get = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or("")
+            .to_string()
+    };
+    UnitShow {
+        load_state: get("LoadState"),
+        active_state: get("ActiveState"),
+        unit_file_state: get("UnitFileState"),
+    }
+}
+
+/// Matches the systemd log line produced when a `stop` job queued on
+/// `orca.service` (e.g. by the unrelated GNOME screen reader's boot-time
+/// setup) makes the following restart transaction "destructive" and refused.
+fn journal_shows_collision(text: &str) -> bool {
+    text.lines()
+        .any(|l| l.contains("orca.service") && l.contains("is destructive"))
+}
+
+/// `ss -ltnp`-style rows naming `process_needle` in the process column,
+/// returning each row's `Local Address:Port` field.
+fn parse_listening_ports(ss_out: &str, process_needle: &str) -> Vec<String> {
+    ss_out
+        .lines()
+        .filter(|l| l.contains(process_needle))
+        .filter_map(|l| l.split_whitespace().nth(3))
+        .map(str::to_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2240,6 +2419,53 @@ mod tests {
             ]
         );
         assert!(!repair_download_contention(root.path(), 4242, &run).0);
+    }
+
+    #[test]
+    fn unit_show_parses_key_value_lines() {
+        let s = parse_unit_show("LoadState=loaded\nActiveState=inactive\nUnitFileState=enabled\n");
+        assert_eq!(s.load_state, "loaded");
+        assert_eq!(s.active_state, "inactive");
+        assert_eq!(s.unit_file_state, "enabled");
+    }
+
+    #[test]
+    fn unit_show_missing_properties_are_empty() {
+        let s = parse_unit_show("ActiveState=active\n");
+        assert_eq!(s.load_state, "");
+        assert_eq!(s.active_state, "active");
+    }
+
+    /// The exact journal excerpt captured on bragi for the stop/restart
+    /// collision that leaves orca.service stuck inactive.
+    const BRAGI_COLLISION_JOURNAL: &str = "\
+systemd[1755]: Started orca.service - orca daemon.
+systemd[1755]: Stopping orca.service - orca daemon...
+systemd[1755]: Requested transaction contradicts existing jobs: Transaction for orca.service/restart is destructive (orca.service has 'stop' job queued, but 'restart' is included in transaction).
+systemd[1755]: Stopped orca.service - orca daemon.";
+
+    #[test]
+    fn journal_collision_matches_the_bragi_excerpt() {
+        assert!(journal_shows_collision(BRAGI_COLLISION_JOURNAL));
+    }
+
+    #[test]
+    fn journal_collision_is_false_on_a_clean_log() {
+        let clean = "systemd[1755]: Started orca.service - orca daemon.\n\
+                      systemd[1755]: orca.service: Deactivated successfully.";
+        assert!(!journal_shows_collision(clean));
+    }
+
+    #[test]
+    fn listening_ports_extracted_from_ss_output() {
+        let ss = "State  Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  Process\n\
+                   LISTEN 0       4096    127.0.0.1:12000     0.0.0.0:*          users:((\"orca\",pid=1234,fd=12))\n\
+                   LISTEN 0       4096    127.0.0.1:12002     0.0.0.0:*          users:((\"orca\",pid=1234,fd=14))\n\
+                   LISTEN 0       128     0.0.0.0:22          0.0.0.0:*          users:((\"sshd\",pid=1,fd=3))";
+        assert_eq!(
+            parse_listening_ports(ss, "orca"),
+            vec!["127.0.0.1:12000", "127.0.0.1:12002"]
+        );
     }
 
     #[test]
